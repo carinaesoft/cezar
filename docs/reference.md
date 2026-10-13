@@ -575,13 +575,33 @@ MCP config. Nothing to configure in cezar.
 ```
 
 **Codex** — `~/.codex/config.toml`. `wait_for_runs` holds a call for up to 45 s,
-so keep `tool_timeout_sec` above that (60 is Codex's default; say it out loud):
+so keep `tool_timeout_sec` above that (60 is Codex's default; say it out loud).
+The first `npx` run downloads cezar, which can outlast Codex's 10 s server
+start-up; `startup_timeout_sec` gives it room:
 
 ```toml
 [mcp_servers.cezar]
 command = "npx"
 args = ["-y", "cezar-run", "mcp"]
+startup_timeout_sec = 60
 tool_timeout_sec = 60
+```
+
+Codex asks before every write tool (`start_run`, `cancel_run`). `codex exec`
+cannot ask, so there an unapproved `start_run` fails. Approve cezar's tools up
+front, either all of them:
+
+```toml
+[mcp_servers.cezar]
+# …as above
+default_tools_approval_mode = "approve"
+```
+
+or one tool at a time:
+
+```toml
+[mcp_servers.cezar.tools.start_run]
+approval_mode = "approve"
 ```
 
 **OpenCode** — `opencode.json`:
@@ -594,16 +614,28 @@ tool_timeout_sec = 60
 ```
 
 Use `cez mcp` instead of `npx -y cezar-run mcp` when cezar is installed as a
+command. The `npx -y cezar-run mcp` snippets need a cezar-run release that
+ships `mcp` (the first one after 0.15.0); an older one does not know the
 command.
 
 **Finding the cockpit.** `--url http://127.0.0.1:4321`, else `CEZ_API_URL`,
 else `cez mcp` probes `GET /api/v1/health` on `127.0.0.1:4321`–`4370`. One
-cockpit found is the answer; with several, the one with a project holding the
-agent's working directory is, and when none does the tools say so and ask for
+cockpit found is the answer. Cockpits on one machine share the project
+registry, so with several the one *started* in the agent's working directory
+(or the nearest directory above it) is the answer; when no cockpit was started
+there, or two were started in the same place, the tools say so and ask for
 `--url` rather than guess. The handshake never needs a cockpit — a missing one is
 a readable tool error — and a cockpit restarted on another port is found again
 on the next call. Inside a cezar task an absent `CEZ_API_URL` still means the
 cockpit withheld it, so `cez mcp` does not probe there.
+
+**Which project.** However the cockpit was found — `--url` and `CEZ_API_URL`
+included — tools that name no `projectId` target `--project` (else
+`CEZ_PROJECT_ID`), else the project in that cockpit's registry holding the
+working directory, else the cockpit's boot project (`default`). A run id is
+global: a read tool (`get_run`, `get_run_status`, `list_run_events`,
+`wait_for_runs`) given no `projectId` follows a run that lives in another
+project; `cancel_run` does not guess and names the project to pass instead.
 
 **Flags.** `--project <id>` sets the project tools target when a call names
 none (else `CEZ_PROJECT_ID`, else the project holding the working directory,
@@ -644,7 +676,19 @@ wait_for_runs { runIds: ["4f1c…"] }                    → { runs: [{ status: 
 list_run_events { runId: "4f1c…", afterSeq: 0 }        → what the agent did
 ```
 
-A run at `waiting` or `review` needs a person in the cockpit.
+A run at `waiting` or `review` needs a person in the cockpit. `mode: "any"`
+answers at once when a run has already settled. A `failed` run settles the wait
+even when it carries `autoResumeAt` (a provider usage limit) — cezar resumes it
+at that time by itself, so wait again after it.
+
+**Answer size.** Every answer stays under 40 000 characters, so it fits a
+client's tool-result limit. `list_run_events` returns at most `maxEvents`
+(default 200, max 500) events, each text field clipped to `maxChars` (default
+1000), and stops at the budget with `truncated: true`. Nothing is lost: with
+`afterSeq` or a `cursor`, continue with `afterSeq: nextAfterSeq` (and the same
+`cursor`); without either — the newest events — read the older part it left out
+with `afterSeq: skippedAfterSeq`. `list_runs` counts rows past the budget in
+`more`, like rows past `limit`.
 
 ### The HTTP API
 
