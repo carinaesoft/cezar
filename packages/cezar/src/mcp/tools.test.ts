@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import { createApiClient, type CezarFetch } from './api.ts';
-import { buildMcpServer, EVENTS_MAX_WALK_PAGES, WAIT_MAX_SECONDS, type Cockpit } from './tools.ts';
+import { buildMcpServer, EVENTS_MAX_WALK_PAGES, RESPONSE_BUDGET_CHARS, WAIT_MAX_SECONDS, type Cockpit } from './tools.ts';
 
 /** The `cez mcp` tool set over a stubbed cockpit (#1109): what is pinned is the route each tool
  *  calls, how it shapes the answer, and the annotations a client decides auto-approval from.
@@ -179,6 +179,40 @@ describe('cez mcp tools: reads', () => {
     expect((p2.structuredContent as { runs: Array<{ id: string }> }).runs.map((r) => r.id)).toEqual(['c']);
   });
 
+  it("list_runs takes projectId 'default' as the boot project, like every other tool", async () => {
+    const row = (id: string, projectId: string) => ({ id, projectId, status: 'done', createdAt: '2026-09-01', archived: false, title: id, workflow: 'q' });
+    const mcp = await connect({
+      'GET /api/v1/workspace/runs-index': { body: { runs: [row('a', 'boot'), row('b', 'p2')], truncated: [], perProjectLimit: 200, referenceStatuses: {} } },
+      'GET /api/v1/projects': { body: { bootProject: 'boot', projectsDir: '/', projects: [] } },
+    });
+    const result = await mcp.callTool({ name: 'list_runs', arguments: { projectId: 'default' } });
+    expect((result.structuredContent as { runs: Array<{ id: string }> }).runs.map((r) => r.id)).toEqual(['a']);
+  });
+
+  it('list_runs stays inside the answer budget and counts the rest as more', async () => {
+    const runs = Array.from({ length: 200 }, (_, i) => ({
+      id: `r${String(i).padStart(3, '0')}`, projectId: 'p', status: 'done', createdAt: `2026-09-01T00:00:${String(i % 60).padStart(2, '0')}Z`,
+      archived: false, title: 'x'.repeat(2_000), workflow: 'q', branch: 'b'.repeat(200),
+    }));
+    const mcp = await connect({ 'GET /api/v1/workspace/runs-index': { body: { runs, truncated: [], perProjectLimit: 200, referenceStatuses: {} } } });
+    const result = await mcp.callTool({ name: 'list_runs', arguments: { limit: 200 } });
+    const body = result.structuredContent as { runs: unknown[]; total: number; more: number };
+    expect(textOf(result).length).toBeLessThanOrEqual(RESPONSE_BUDGET_CHARS);
+    expect(body.total).toBe(200);
+    expect(body.runs.length + body.more).toBe(200);
+    expect(body.runs.length).toBeGreaterThan(10);
+  });
+
+  it('get_run of a pathological record stays inside the answer budget', async () => {
+    const steps = Array.from({ length: 200 }, (_, i) => ({ id: `s${i}`, status: 'done', output: 'y'.repeat(5_000) }));
+    const mcp = await connect({ 'GET /api/v1/p/default/runs/r1': { body: run('r1', 'done', { steps }) } });
+    const result = await mcp.callTool({ name: 'get_run', arguments: { runId: 'r1' } });
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result).length).toBeLessThanOrEqual(RESPONSE_BUDGET_CHARS);
+    expect(JSON.stringify(result.structuredContent).length).toBeLessThanOrEqual(RESPONSE_BUDGET_CHARS);
+    expect((result.structuredContent as { id: string }).id).toBe('r1');
+  });
+
   it('project-scoped tools hit the /p/:projectId spelling, defaulting to the cockpit default project', async () => {
     const calls: Call[] = [];
     const mcp = await connect(
@@ -204,11 +238,61 @@ describe('cez mcp tools: reads', () => {
     expect(body.futureKey).toBe(1);
   });
 
+  describe('a run outside the default project, without projectId', () => {
+    const index = { body: { runs: [{ id: 'r1', projectId: 'p2', status: 'done', createdAt: '2026-09-01', archived: false, title: 't', workflow: 'q' }], truncated: [], perProjectLimit: 200, referenceStatuses: {} } };
+    const routes = (): Routes => ({
+      'GET /api/v1/workspace/runs-index': index,
+      'GET /api/v1/p/p2/runs/r1': { body: run('r1', 'done') },
+      'GET /api/v1/p/p2/runs/r1/history': { body: { events: [{ seq: 1, ts: 't', type: 'text' }], itemCount: 1, liveCursor: 'l', asOfSeq: 1, hasOlder: false } },
+      'POST /api/v1/p/p2/runs/r1/cancel': { body: { cancelled: true } },
+    });
+
+    it.each([
+      ['get_run', {}],
+      ['get_run_status', {}],
+      ['list_run_events', {}],
+      ['wait_for_runs', { runIds: ['r1'] }],
+    ])('%s finds its project through the cross-project index', async (name, extra) => {
+      const calls: Call[] = [];
+      const mcp = await connect(routes(), { calls });
+      const result = await mcp.callTool({ name, arguments: name === 'wait_for_runs' ? extra : { runId: 'r1', ...extra } });
+      expect(result.isError, textOf(result)).toBeFalsy();
+      expect(calls.map((c) => c.url.pathname)).toContain('/api/v1/workspace/runs-index');
+      expect(calls.at(-1)?.url.pathname.startsWith('/api/v1/p/p2/runs/r1')).toBe(true);
+    });
+
+    it('wait_for_runs looks the project up once, not on every poll', async () => {
+      const calls: Call[] = [];
+      let n = 0;
+      const mcp = await connect(
+        { ...routes(), 'GET /api/v1/p/p2/runs/r1': () => ({ body: run('r1', (n += 1) < 3 ? 'running' : 'done') }) },
+        { calls },
+      );
+      await mcp.callTool({ name: 'wait_for_runs', arguments: { runIds: ['r1'], timeoutSeconds: 10 } });
+      expect(calls.filter((c) => c.url.pathname === '/api/v1/workspace/runs-index')).toHaveLength(1);
+    });
+
+    it('cancel_run does not guess: it names the project instead', async () => {
+      const calls: Call[] = [];
+      const mcp = await connect(routes(), { calls });
+      const result = await mcp.callTool({ name: 'cancel_run', arguments: { runId: 'r1' } });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toBe('cezar refused: 404: not found — run r1 belongs to project "p2"; pass projectId: "p2"');
+      expect(calls.filter((c) => c.method === 'POST').map((c) => c.url.pathname)).toEqual(['/api/v1/p/default/runs/r1/cancel']);
+    });
+
+    it('a run the index does not know either: the hint names projectId', async () => {
+      const mcp = await connect({ 'GET /api/v1/workspace/runs-index': { body: { ...index.body, runs: [] } } });
+      const result = await mcp.callTool({ name: 'get_run_status', arguments: { runId: 'r1' } });
+      expect(textOf(result)).toMatch(/not in the default project; pass its projectId/);
+    });
+  });
+
   it('a refusal from the cockpit is a readable tool error, not a protocol error', async () => {
     const mcp = await connect({});
     const result = await mcp.callTool({ name: 'get_run', arguments: { runId: 'missing' } });
     expect(result.isError).toBe(true);
-    expect(textOf(result)).toBe('cezar refused: 404: not found');
+    expect(textOf(result)).toMatch(/^cezar refused: 404: not found — run missing is not in the default project/);
   });
 
   it('an answer in an unknown shape is a readable tool error', async () => {
@@ -332,6 +416,74 @@ describe('cez mcp tools: list_run_events', () => {
     expect(body.events[0]?.seq).toBe(101);
     expect(body.events.at(-1)?.seq).toBe(400);
     expect(body.events.map((e) => e.seq)).toEqual(range(101, 400).map((e) => e.seq));
+  });
+
+  describe('the answer budget', () => {
+    /** 100 events of ~3 kB text each: ~300 kB of history, like a long real run's page. */
+    const big = (from: number, to: number, olderCursor?: string) => ({
+      ...page(from, to, olderCursor),
+      events: Array.from({ length: to - from + 1 }, (_, i) => ({ seq: from + i, ts: '2026-10-13T10:00:00.000Z', type: 'tool.result', text: 'z'.repeat(3_000), extra: 'q'.repeat(3_000) })),
+    });
+    const history = (pages: Record<string, unknown>) =>
+      ({ 'GET /api/v1/p/default/runs/r1/history': (url: URL) => ({ body: pages[url.searchParams.get('cursor') ?? 'tip'] }) }) satisfies Routes;
+    type Body = { events: Array<{ seq: number }>; truncated?: boolean; nextAfterSeq?: number; skippedAfterSeq?: number; gap?: boolean };
+
+    it('without arguments keeps the newest events inside the budget, text and structuredContent alike', async () => {
+      const mcp = await connect(history({ tip: big(901, 1_000, 'c1') }));
+      const result = await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1' } });
+      const body = result.structuredContent as Body;
+      expect(textOf(result).length).toBeLessThanOrEqual(RESPONSE_BUDGET_CHARS);
+      expect(JSON.stringify(body).length).toBeLessThanOrEqual(RESPONSE_BUDGET_CHARS);
+      expect(body.truncated).toBe(true);
+      expect(body.events.at(-1)?.seq).toBe(1_000);
+      expect(body.skippedAfterSeq).toBe(900);
+    });
+
+    it('nextAfterSeq / skippedAfterSeq read every event exactly once, without losing one', async () => {
+      const mcp = await connect(history({ tip: big(901, 1_000, 'c1'), c1: big(801, 900, 'c2'), c2: big(701, 800) }));
+      const seen: number[] = [];
+      const first = (await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1' } })).structuredContent as Body;
+      const tail = first.events.map((e) => e.seq);
+      let afterSeq = first.skippedAfterSeq!;
+      for (let i = 0; i < 20 && afterSeq < tail[0]! - 1; i += 1) {
+        const result = await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', afterSeq } });
+        expect(textOf(result).length).toBeLessThanOrEqual(RESPONSE_BUDGET_CHARS);
+        const body = result.structuredContent as Body;
+        seen.push(...body.events.map((e) => e.seq).filter((s) => s < tail[0]!));
+        if (!body.nextAfterSeq) break;
+        afterSeq = body.nextAfterSeq;
+      }
+      expect([...seen, ...tail]).toEqual(Array.from({ length: 100 }, (_, i) => 901 + i));
+    });
+
+    it('afterSeq: 0 on a long run answers in the budget and says where to continue', async () => {
+      const mcp = await connect(history({ tip: big(901, 1_000, 'c1'), c1: big(801, 900, 'c2'), c2: big(701, 800, 'c3'), c3: big(601, 700, 'c4'), c4: big(501, 600, 'c5'), c5: big(401, 500, 'c6') }));
+      const result = await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', afterSeq: 0 } });
+      const body = result.structuredContent as Body & { olderCursor?: string };
+      expect(textOf(result).length).toBeLessThanOrEqual(RESPONSE_BUDGET_CHARS);
+      expect(body.gap).toBe(true);
+      expect(body.olderCursor).toBe('c6');
+      expect(body.events[0]?.seq).toBe(401);
+      expect(body.nextAfterSeq).toBe(body.events.at(-1)?.seq);
+    });
+
+    it('with a cursor, continues inside the same page through cursor + afterSeq', async () => {
+      const calls: Call[] = [];
+      const mcp = await connect(history({ tip: big(901, 1_000, 'c1'), c1: big(801, 900, 'c2') }), { calls });
+      const a = (await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', cursor: 'c1' } })).structuredContent as Body;
+      expect(a.events[0]?.seq).toBe(801);
+      const b = (await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', cursor: 'c1', afterSeq: a.nextAfterSeq } })).structuredContent as Body;
+      expect(b.events[0]?.seq).toBe(a.nextAfterSeq! + 1);
+      expect(calls.every((c) => c.url.searchParams.get('cursor') === 'c1')).toBe(true);
+    });
+
+    it('maxEvents caps the count; one event bigger than the budget is clipped, never stalls the cursor', async () => {
+      const mcp = await connect(history({ tip: { ...page(1, 3), events: [1, 2, 3].map((seq) => ({ seq, ts: 't', type: 'x', ...Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`k${i}`, 'w'.repeat(20_000)])) })) } }));
+      const capped = (await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', afterSeq: 0, maxEvents: 1, maxChars: 20_000 } })).structuredContent as Body;
+      expect(capped.events.map((e) => e.seq)).toEqual([1]);
+      expect(capped.nextAfterSeq).toBe(1);
+      expect(JSON.stringify(capped).length).toBeLessThanOrEqual(RESPONSE_BUDGET_CHARS);
+    });
   });
 
   it('a cursor is passed through to /history', async () => {
@@ -479,7 +631,22 @@ describe('cez mcp tools: wait_for_runs', () => {
     const mcp = await connect({});
     const result = await mcp.callTool({ name: 'wait_for_runs', arguments: { runIds: ['nope'] } });
     expect(result.isError).toBe(true);
-    expect(textOf(result)).toBe('cezar refused: 404: not found');
+    expect(textOf(result)).toMatch(/^cezar refused: 404: not found — run nope/);
+  });
+
+  it('a failed poll ends the polls still in flight', async () => {
+    let stalled: AbortSignal | undefined;
+    const mcp = await connect({
+      'GET /api/v1/p/default/runs/bad': { status: 500, body: { error: 'boom' } },
+      'GET /api/v1/p/default/runs/slow': (_url, init) => {
+        stalled = init?.signal ?? undefined;
+        return new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal?.reason)));
+      },
+    });
+    const result = await mcp.callTool({ name: 'wait_for_runs', arguments: { runIds: ['slow', 'bad'], timeoutSeconds: 30 } });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toBe('cezar refused: 500: boom');
+    expect(stalled?.aborted).toBe(true);
   });
 
   it(`refuses a timeout past the client-safe ceiling of ${WAIT_MAX_SECONDS} s`, async () => {

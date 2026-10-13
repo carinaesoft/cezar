@@ -38,7 +38,7 @@ import {
   workflowDefSchema,
   workflowLoadIssueSchema,
 } from '@open-mercato/cezar-contract';
-import { CezarApiError, isConnectionError, readJson, type CezarClient } from './api.ts';
+import { CezarApiError, isConnectionError, longDeadline, readJson, type CezarClient } from './api.ts';
 
 /** A reachable cockpit: its client, and the project a tool call targets when it names none. */
 export interface Cockpit {
@@ -66,6 +66,11 @@ export const WAIT_POLL_MS = 2_000;
 const MODELS_TIMEOUT_MS = 30_000;
 /** Without `afterSeq` on `/history`, catching up walks back at most this many pages (100 items each). */
 export const EVENTS_MAX_WALK_PAGES = 5;
+/** One tool answer, serialized. It travels twice (text + structuredContent) and Claude Code refuses
+ *  results past ~25k tokens; a long run's history page alone was ~344k chars. */
+export const RESPONSE_BUDGET_CHARS = 40_000;
+export const EVENTS_DEFAULT_MAX = 200;
+export const EVENTS_MAX = 500;
 
 // ---- inputs ----------------------------------------------------------------------------------
 
@@ -146,6 +151,17 @@ const eventsOutput = runHistoryPageSchema.pick({ asOfSeq: true, olderCursor: tru
     .boolean()
     .optional()
     .describe('true: events between afterSeq and the first one returned were not read — page back with olderCursor.'),
+  truncated: z.boolean().optional().describe('true: more events matched than fit in one answer — see nextAfterSeq / skippedAfterSeq.'),
+  nextAfterSeq: z
+    .number()
+    .int()
+    .optional()
+    .describe('Newer events were left out: call again with afterSeq set to this (and the same cursor, if you passed one).'),
+  skippedAfterSeq: z
+    .number()
+    .int()
+    .optional()
+    .describe('Older events of the newest page were left out: call with afterSeq set to this to read them.'),
 });
 
 const waitOutput = z.object({
@@ -165,7 +181,35 @@ const prStatusOutput = refStatusAvailable
 const READ: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 
 function ok(data: Record<string, unknown>): CallToolResult {
-  return { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data };
+  const fitted = fitToBudget(data);
+  return { content: [{ type: 'text', text: JSON.stringify(fitted) }], structuredContent: fitted };
+}
+
+const sizeOf = (value: unknown) => JSON.stringify(value).length;
+
+/** Last-resort net under every answer: clip strings harder, then cap arrays, until it fits the
+ *  budget. Tools that can grow by rows (list_runs, list_run_events) cut rows themselves first and
+ *  say so in the answer; this only keeps a pathological record from flooding the client. */
+export function fitToBudget<T>(data: T, budget = RESPONSE_BUDGET_CHARS): T {
+  if (sizeOf(data) <= budget) return data;
+  let fitted = data;
+  for (const max of [1_000, 500, 200]) {
+    fitted = clip(data, max);
+    if (sizeOf(fitted) <= budget) return fitted;
+  }
+  for (const items of [20, 5, 1]) {
+    fitted = capArrays(clip(data, 200), items);
+    if (sizeOf(fitted) <= budget) return fitted;
+  }
+  return fitted;
+}
+
+function capArrays<T>(value: T, items: number): T {
+  if (Array.isArray(value)) return value.slice(0, items).map((v: unknown) => capArrays(v, items)) as T;
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, capArrays(v, items)])) as T;
+  }
+  return value;
 }
 
 function fail(message: string): CallToolResult {
@@ -278,7 +322,7 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
     },
     ({ runner }) =>
       read(async ({ api }) => {
-        const init = { signal: AbortSignal.timeout(MODELS_TIMEOUT_MS) };
+        const init = { signal: longDeadline(MODELS_TIMEOUT_MS) };
         return runnerModelCatalogResponseSchema.parse(await readJson(await api.api.v1.models.$get({ query: { runner } }, { init })));
       }),
   );
@@ -300,32 +344,68 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
     ({ projectId, status, includeArchived, limit }) =>
       read(async ({ api }) => {
         const body = await readJson(await api.api.v1.workspace['runs-index'].$get());
+        // Index rows carry real ids; `default` means the boot project, as on every other tool.
+        const only = projectId === 'default' ? (await readJson(await api.api.v1.projects.$get())).bootProject : projectId;
         const wanted = status ? new Set<string>(status) : undefined;
         const rows = body.runs
-          .filter((r) => (projectId ? r.projectId === projectId : true))
+          .filter((r) => (only ? r.projectId === only : true))
           .filter((r) => (wanted ? wanted.has(r.status) : true))
           .filter((r) => (includeArchived ? true : !r.archived))
           .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-        const max = limit ?? 20;
+        const picked = rows.slice(0, limit ?? 20).map((r) => runRowOutput.parse(clip({ ...r, title: r.titleSummary ?? r.title }, 300)));
+        // Rows past the budget become `more`, like rows past the limit.
+        let room = RESPONSE_BUDGET_CHARS - sizeOf({ runs: [], total: rows.length, more: rows.length, truncated: body.truncated });
+        const runs = picked.filter((r) => (room -= sizeOf(r) + 1) >= 0);
         return runsOutput.parse({
-          runs: rows.slice(0, max).map((r) => ({ ...r, title: r.titleSummary ?? r.title })),
+          runs,
           total: rows.length,
-          ...(rows.length > max ? { more: rows.length - max } : {}),
+          ...(rows.length > runs.length ? { more: rows.length - runs.length } : {}),
           truncated: body.truncated,
         });
       }),
   );
 
-  const getRun = async (c: Cockpit, projectId: string | undefined, runId: string, signal?: AbortSignal) =>
-    readJson(
-      await c.api.api.v1.p[':projectId'].runs[':id'].$get(
-        { param: { projectId: projectOf(c, projectId), id: runId } },
-        signal ? { init: { signal } } : undefined,
-      ),
+  /** The project a run lives in, from the cross-project index (`undefined` when the index — capped
+   *  per project — does not list it). */
+  const findRunProject = async (c: Cockpit, runId: string) =>
+    (await readJson(await c.api.api.v1.workspace['runs-index'].$get())).runs.find((r) => r.id === runId)?.projectId;
+  const isNotFound = (error: unknown) => error instanceof CezarApiError && error.status === 404;
+  const notFoundHint = (runId: string, error: CezarApiError, found?: string) =>
+    new CezarApiError(
+      404,
+      found
+        ? `${error.message} — run ${runId} belongs to project "${found}"; pass projectId: "${found}"`
+        : `${error.message} — run ${runId} is not in the default project; pass its projectId (list_runs shows it)`,
     );
+  /**
+   * Run `fn` against the run's project. Named: that one. Not named: the default project, and on a
+   * 404 the project the cross-project index places the run in — a run id is global, so a read may
+   * follow it. Writes pass `follow: false` and get the hint instead of a guess.
+   */
+  const inRunProject = async <T>(
+    c: Cockpit,
+    projectId: string | undefined,
+    runId: string,
+    fn: (projectId: string) => Promise<T>,
+    { follow = true }: { follow?: boolean } = {},
+  ): Promise<T> => {
+    if (projectId) return fn(projectId);
+    try {
+      return await fn(c.defaultProjectId);
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+      const found = await findRunProject(c, runId).catch(() => undefined);
+      if (follow && found && found !== c.defaultProjectId) return fn(found);
+      throw notFoundHint(runId, error as CezarApiError, found);
+    }
+  };
+  const readRun = async (c: Cockpit, projectId: string, runId: string, signal?: AbortSignal) =>
+    readJson(await c.api.api.v1.p[':projectId'].runs[':id'].$get({ param: { projectId, id: runId } }, signal ? { init: { signal } } : undefined));
+  const getRun = (c: Cockpit, projectId: string | undefined, runId: string) =>
+    inRunProject(c, projectId, runId, (pid) => readRun(c, pid, runId));
   const statusOf = (run: unknown): RunStatusOutput => {
     const status = runStatusOutput.parse(run);
-    return status.error === undefined ? status : { ...status, error: clip(status.error, 500) };
+    return { ...clip(status, 300), ...(status.error === undefined ? {} : { error: clip(status.error, 500) }) };
   };
 
   server.registerTool(
@@ -357,51 +437,81 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
     {
       title: 'List run events',
       description:
-        'Transcript events of a run, oldest first, one page (100 transcript items) at a time. Without arguments: the newest page. ' +
+        'Transcript events of a run, oldest first, from one page (100 transcript items) at a time, capped at ' +
+        `${RESPONSE_BUDGET_CHARS} characters per answer. Without arguments: the newest events. ` +
         'Remember asOfSeq and pass it back as afterSeq to read only what happened since; pass olderCursor / newerCursor ' +
-        'from a previous answer to page. Cursors are short-lived — a seq is what to keep between calls.',
+        'from a previous answer to page. truncated: true means events were left out for size — continue with afterSeq: nextAfterSeq ' +
+        '(plus the same cursor, if you passed one), or read the skipped older ones with afterSeq: skippedAfterSeq. ' +
+        'Cursors are short-lived — a seq is what to keep between calls.',
       inputSchema: runArgs.extend({
         cursor: runHistoryCursorSchema.optional().describe('olderCursor or newerCursor from a previous call.'),
         afterSeq: z.number().int().nonnegative().optional().describe('Only events with a seq greater than this.'),
         maxChars: z.number().int().min(100).max(20_000).optional().describe('Clip each text field to this (default 1000).'),
+        maxEvents: z
+          .number()
+          .int()
+          .min(1)
+          .max(EVENTS_MAX)
+          .optional()
+          .describe(`At most this many events (default ${EVENTS_DEFAULT_MAX}). The answer is also capped at ${RESPONSE_BUDGET_CHARS} characters.`),
       }),
       outputSchema: eventsOutput,
       annotations: READ,
     },
-    ({ projectId, runId, cursor, afterSeq, maxChars }) =>
-      read(async (c) => {
-        const param = { projectId: projectOf(c, projectId), id: runId };
-        const page = async (at?: string) =>
-          readJson(await c.api.api.v1.p[':projectId'].runs[':id'].history.$get({ param, query: at ? { cursor: at } : {} }));
-        const first = await page(cursor);
-        const bySeq = new Map(first.events.map((e) => [e.seq, e]));
-        let olderCursor = first.hasOlder ? first.olderCursor : undefined;
-        let coveredFrom = pageStart(first.events);
-        // `/history` has no `afterSeq` yet (a separate PR, #1109): walk back from the tip, bounded,
-        // until a page starts at or below `afterSeq`.
-        if (afterSeq !== undefined && cursor === undefined) {
-          for (let walked = 0; olderCursor && coveredFrom > afterSeq && walked < EVENTS_MAX_WALK_PAGES; walked += 1) {
-            const older = await page(olderCursor);
-            for (const e of older.events) bySeq.set(e.seq, e);
-            coveredFrom = Math.min(coveredFrom, pageStart(older.events));
-            olderCursor = older.hasOlder ? older.olderCursor : undefined;
+    ({ projectId, runId, cursor, afterSeq, maxChars, maxEvents }) =>
+      read((c) =>
+        inRunProject(c, projectId, runId, async (pid) => {
+          const param = { projectId: pid, id: runId };
+          const page = async (at?: string) =>
+            readJson(await c.api.api.v1.p[':projectId'].runs[':id'].history.$get({ param, query: at ? { cursor: at } : {} }));
+          const first = await page(cursor);
+          const bySeq = new Map(first.events.map((e) => [e.seq, e]));
+          let olderCursor = first.hasOlder ? first.olderCursor : undefined;
+          let coveredFrom = pageStart(first.events);
+          // Every event from `coveredFrom` on has been read, so the range is reached once it is at
+          // most `afterSeq + 1` (seqs are integers).
+          const covers = () => afterSeq === undefined || coveredFrom <= afterSeq + 1;
+          // `/history` has no `afterSeq` yet (a separate PR, #1109): walk back from the tip, bounded,
+          // until a page starts at or below `afterSeq`.
+          if (afterSeq !== undefined && cursor === undefined) {
+            for (let walked = 0; olderCursor && !covers() && walked < EVENTS_MAX_WALK_PAGES; walked += 1) {
+              const older = await page(olderCursor);
+              for (const e of older.events) bySeq.set(e.seq, e);
+              coveredFrom = Math.min(coveredFrom, pageStart(older.events));
+              olderCursor = older.hasOlder ? older.olderCursor : undefined;
+            }
           }
-        }
-        const reached = afterSeq === undefined || coveredFrom <= afterSeq || !olderCursor;
-        const events = [...bySeq.values()]
-          // With a gap, a page's leading turn opener sits below the read range — drop it, so
-          // "between afterSeq and the first event" is exactly what is left unread.
-          .filter((e) => (afterSeq === undefined ? true : e.seq > afterSeq && (reached || e.seq >= coveredFrom)))
-          .sort((a, b) => a.seq - b.seq)
-          .map((e) => clip(e, maxChars ?? 1_000));
-        return eventsOutput.parse({
-          events,
-          asOfSeq: first.asOfSeq,
-          ...(olderCursor && (afterSeq === undefined || !reached) ? { olderCursor } : {}),
-          ...(first.newerCursor ? { newerCursor: first.newerCursor } : {}),
-          ...(reached ? {} : { gap: true }),
-        });
-      }),
+          const reached = covers() || !olderCursor;
+          const events = [...bySeq.values()]
+            // With a gap, a page's leading turn opener sits below the read range — drop it, so
+            // "between afterSeq and the first event" is exactly what is left unread.
+            .filter((e) => (afterSeq === undefined ? true : e.seq > afterSeq && (reached || e.seq >= coveredFrom)))
+            .sort((a, b) => a.seq - b.seq)
+            .map((e) => clip(e, maxChars ?? 1_000));
+          const envelope = {
+            asOfSeq: first.asOfSeq,
+            ...(olderCursor && (afterSeq === undefined || !reached) ? { olderCursor } : {}),
+            ...(first.newerCursor ? { newerCursor: first.newerCursor } : {}),
+            ...(reached ? {} : { gap: true }),
+          };
+          // Without a position, the caller asked for the newest: keep the tail and name where the
+          // cut-off head starts. With one, keep the head and name where to continue.
+          const newest = afterSeq === undefined && cursor === undefined;
+          const kept = fitEvents(newest ? [...events].reverse() : events, {
+            max: maxEvents ?? EVENTS_DEFAULT_MAX,
+            room: RESPONSE_BUDGET_CHARS - sizeOf({ ...envelope, events: [], truncated: true, nextAfterSeq: first.asOfSeq, skippedAfterSeq: first.asOfSeq }),
+          });
+          if (newest) kept.reverse();
+          const cut = events.length - kept.length;
+          return eventsOutput.parse({
+            ...envelope,
+            events: kept,
+            ...(cut > 0 ? { truncated: true } : {}),
+            ...(cut > 0 && !newest ? { nextAfterSeq: kept.at(-1)!.seq } : {}),
+            ...(cut > 0 && newest ? { skippedAfterSeq: pageStart(events.slice(0, cut)) - 1 } : {}),
+          });
+        }),
+      ),
   );
 
   server.registerTool(
@@ -410,8 +520,9 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       title: 'Wait for runs',
       description:
         `Wait until runs settle (done, failed, cancelled, or parked at waiting/review) or the timeout ` +
-        `(max ${WAIT_MAX_SECONDS} s) passes, then answer with their status. mode "any" returns at the first settled run, ` +
-        '"all" when every one has. On timedOut: true, just call it again.',
+        `(max ${WAIT_MAX_SECONDS} s) passes, then answer with their status. mode "any" returns at the first settled run — ` +
+        'at once if one already is — and "all" when every one has. "failed" settles a run even when autoResumeAt is set ' +
+        '(a usage limit: cezar resumes it at that time on its own, so wait again after it). On timedOut: true, just call it again.',
       inputSchema: z.object({
         projectId: projectIdArg,
         runIds: z.array(runIdArg).min(1).max(20),
@@ -429,17 +540,27 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
     },
     // Not retried: a second wait would carry the call past the client's own tool timeout. The
     // dropped address is still re-discovered on the next call.
-    ({ projectId, runIds, mode, timeoutSeconds }, ctx) =>
-      call((c) =>
+    ({ projectId, runIds, mode, timeoutSeconds }, ctx) => {
+      const found = new Map<string, string>();
+      return call((c) =>
         waitForRuns(ctx, {
           runIds: [...new Set(runIds)],
           mode: mode ?? 'any',
           timeoutMs: (timeoutSeconds ?? WAIT_DEFAULT_SECONDS) * 1000,
           pollMs,
-          fetchRun: async (id, signal) => statusOf(await getRun(c, projectId, id, signal)),
+          // A followed run's project is looked up once, not on every poll.
+          fetchRun: async (id, signal) =>
+            statusOf(
+              await inRunProject(c, projectId ?? found.get(id), id, async (pid) => {
+                const run = await readRun(c, pid, id, signal);
+                found.set(id, pid);
+                return run;
+              }),
+            ),
         }),
         { retry: false },
-      ),
+      );
+    },
   );
 
   server.registerTool(
@@ -499,7 +620,13 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
     ({ projectId, runId }) =>
       write(async (c) =>
         cancelResponseSchema.parse(
-          await readJson(await c.api.api.v1.p[':projectId'].runs[':id'].cancel.$post({ param: { projectId: projectOf(c, projectId), id: runId } })),
+          await inRunProject(
+            c,
+            projectId,
+            runId,
+            async (pid) => readJson(await c.api.api.v1.p[':projectId'].runs[':id'].cancel.$post({ param: { projectId: pid, id: runId } })),
+            { follow: false },
+          ),
         ),
       ),
   );
@@ -518,6 +645,27 @@ function pageStart(events: ReadonlyArray<{ seq: number; type: string }>): number
   const [head, next] = events;
   if (!head) return Number.POSITIVE_INFINITY;
   return next && (head.type === 'user-message' || head.type === 'turn.started') ? next.seq : head.seq;
+}
+
+/** Take events in the given order until `max` or the character room runs out. The first event is
+ *  always taken, clipped harder if it must be, so a continuation can never stall on it. */
+function fitEvents<E>(events: E[], { max, room }: { max: number; room: number }): E[] {
+  const kept: E[] = [];
+  for (const event of events) {
+    if (kept.length >= max) break;
+    let item = event;
+    if (kept.length === 0) {
+      for (const at of [500, 200, 100]) {
+        if (sizeOf(item) + 1 <= room) break;
+        item = clip(event, at);
+      }
+    }
+    const cost = sizeOf(item) + 1;
+    if (kept.length > 0 && cost > room) break;
+    kept.push(item);
+    room -= cost;
+  }
+  return kept;
 }
 
 interface WaitInput {
@@ -565,6 +713,8 @@ async function waitForRuns(ctx: ServerContext, input: WaitInput): Promise<z.infe
   } finally {
     clearTimeout(timer);
     clientSignal.removeEventListener('abort', onClientAbort);
+    // A failed poll leaves its siblings in flight — end them with the wait.
+    abort.abort();
   }
   return {
     runs: input.runIds.map((id) => latest.get(id) ?? { id, status: 'unknown' }),
