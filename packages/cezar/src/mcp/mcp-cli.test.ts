@@ -136,6 +136,7 @@ describe('cockpit discovery', () => {
     const result = await discoverCockpit(stall, '/work/mono');
     expect(result.url).toBe('http://127.0.0.1:4321');
     expect(result.incomplete).toEqual([expect.stringMatching(/^127\.0\.0\.1:4345 accepted a connection but did not answer/)]);
+    expect(result.stalledPorts).toEqual([4345]);
     // nothing else answering: the error names the stalled port instead of "no cockpit"
     const onlyStalled: CezarFetchLike = (input, init) =>
       new URL(String(input)).port === '4345' ? stall(input, init) : Promise.reject(new TypeError('fetch failed'));
@@ -233,10 +234,12 @@ describe('cockpit resolver', () => {
     });
     const first = await resolve();
     expect(first.defaultProjectId).toBe('mono');
+    expect(first.writeRefused).toMatch(/127\.0\.0\.1:4345 accepted a connection but did not answer.*pass --url/);
     expect(warnings).toEqual([expect.stringMatching(/127\.0\.0\.1:4345 accepted a connection but did not answer .*this call only/)]);
     stalled = false;
     const second = await resolve();
     expect(second).not.toBe(first);
+    expect(second.writeRefused).toBeUndefined();
     expect(await resolve()).toBe(second);
     expect(warnings).toHaveLength(1);
   }, 15_000);
@@ -355,6 +358,55 @@ describe('cez mcp flags', () => {
     expect(names).not.toContain('cancel_run');
     expect(names).toContain('wait_for_runs');
   });
+
+  it('a stalled port blocks writes, not reads: start_run never goes to the cockpit that did answer', async () => {
+    // Live QA of #1109: repoB's cockpit (4345) stopped, cwd in repoB — start_run landed in repoA's (4343).
+    let stalled = true;
+    const writes: string[] = [];
+    const base = cockpits(
+      [
+        { id: 'repoa', root: '/work/repoa' },
+        { id: 'repob', root: '/work/repob' },
+      ].map((p) => ({ ...p, name: p.id, status: 'ok' })),
+      { 4343: 'repoa', 4345: 'repob' },
+    );
+    const h = io({
+      cwd: '/work/repob',
+      fetch: (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        if (stalled && url.port === '4345') return new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal?.reason)));
+        const method = input instanceof Request ? input.method : (init?.method ?? 'GET');
+        if (method !== 'GET') writes.push(`${method} ${url.href}`);
+        return base(input);
+      },
+    });
+    await runMcpCommand([], {}, h.harness);
+    const server = await h.factories[0]!({ era: 'legacy' } as Parameters<McpServerFactory>[0]);
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    const client = new Client({ name: 't', version: '0' });
+    await client.connect(clientSide);
+    const text = (r: Awaited<ReturnType<Client['callTool']>>) => (r.content as Array<{ text: string }>)[0]!.text;
+
+    for (const [name, args] of [
+      ['start_run', { workflow: 'quick-task', task: 'x' }],
+      ['start_run', { workflow: 'quick-task', task: 'x', projectId: 'repob' }],
+      ['cancel_run', { runId: 'r1' }],
+    ] as const) {
+      const refused = await client.callTool({ name, arguments: args });
+      expect(refused.isError, name).toBe(true);
+      expect(text(refused)).toMatch(/127\.0\.0\.1:4345 accepted a connection but did not answer.*pass --url/);
+    }
+    expect(writes).toEqual([]);
+    const listed = await client.callTool({ name: 'list_projects', arguments: {} });
+    expect(listed.isError, text(listed)).toBeFalsy();
+    expect(h.err.some((l) => /4345 accepted a connection.*this call only/.test(l))).toBe(true);
+
+    stalled = false;
+    await client.callTool({ name: 'start_run', arguments: { workflow: 'quick-task', task: 'x' } });
+    await client.close();
+    expect(writes).toEqual(['POST http://127.0.0.1:4345/api/v1/p/repob/runs']);
+  }, 60_000);
 });
 
 /** A client-side newline-delimited JSON-RPC transport over a pair of streams — the shape of a

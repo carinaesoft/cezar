@@ -629,7 +629,10 @@ a readable tool error — and a cockpit restarted on another port is found again
 on the next call. A port that accepts the connection but misses the 800 ms probe
 is asked once more with 3 s; if it still says nothing, the choice is made without
 it, `cez mcp` names that port on stderr, and the answer is used for that call only
-— the next call looks again. Inside a cezar task an absent `CEZ_API_URL` still means the
+— the next call looks again. That silent port may be the cockpit the working
+directory belongs to, so only reads go ahead without it: `start_run` and
+`cancel_run` send nothing and fail naming the port, asking for `--url` (or
+`CEZ_API_URL`), and work again once that port answers. Inside a cezar task an absent `CEZ_API_URL` still means the
 cockpit withheld it, so `cez mcp` does not probe there.
 
 **Which project.** However the cockpit was found — `--url` and `CEZ_API_URL`

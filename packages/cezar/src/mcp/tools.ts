@@ -47,6 +47,9 @@ export interface Cockpit {
   /** Set when the project holding the cwd could not be determined: why. Reads still use
    *  `defaultProjectId`; `start_run` without a `projectId` refuses with this instead of guessing. */
   projectUnknown?: string;
+  /** Set when discovery could not rule out another cockpit (a port that stalled): why. Every
+   *  write refuses with this; reads go ahead. */
+  writeRefused?: string;
 }
 
 export interface McpToolsOptions {
@@ -285,7 +288,11 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
     }
   };
   const read = (fn: (c: Cockpit) => Promise<Record<string, unknown>>) => call(fn, { retry: true });
-  const write = (fn: (c: Cockpit) => Promise<Record<string, unknown>>) => call(fn, { retry: false });
+  const write = (fn: (c: Cockpit) => Promise<Record<string, unknown>>) =>
+    call(async (c) => {
+      if (c.writeRefused) throw new Error(c.writeRefused);
+      return fn(c);
+    }, { retry: false });
 
   server.registerTool(
     'list_projects',

@@ -78,6 +78,9 @@ export interface DiscoveredCockpit {
   /** What the choice was made without — a port that stalled, a registry that failed. Such an
    *  answer is used once and not kept. */
   incomplete?: string[];
+  /** Ports that accepted a connection but never answered `/health`: one of them may be the
+   *  cockpit this cwd belongs to, so a write must not go anywhere else. */
+  stalledPorts?: number[];
 }
 
 function canonical(path: string): string {
@@ -176,6 +179,7 @@ export async function discoverCockpit(fetchImpl: CezarFetch, cwd: string, header
     ...(c.bootProject ? { bootProject: c.bootProject } : {}),
     ...(c.failed ? { registryUnread: c.failed } : {}),
     ...(incomplete.length ? { incomplete } : {}),
+    ...(stalled.length ? { stalledPorts: stalled } : {}),
   });
   if (cockpits.length === 1) return answer(cockpits[0]!);
   const bootedAround = cockpits
@@ -250,6 +254,7 @@ export function createCockpitResolver(options: CockpitResolverOptions): () => Pr
     // Without the registry the project holding the cwd is unknown: reads fall back to the boot
     // project, a write must not guess (start_run, re-QA of #1109).
     const unknown = !options.projectId && target.registryUnread;
+    const stalled = target.stalledPorts ?? [];
     return {
       cockpit: {
         api: createApiClient({ baseUrl: target.url, fetch: fetchWithDeadline, ...(options.headers ? { headers: options.headers } : {}) }),
@@ -258,6 +263,13 @@ export function createCockpitResolver(options: CockpitResolverOptions): () => Pr
         ...(unknown
           ? {
               projectUnknown: `could not read the project list of ${target.url} (${target.registryUnread}), so which project holds ${options.cwd} is unknown — pass projectId (list_projects), or try again`,
+            }
+          : {}),
+        // A silent port may be the right cockpit: reads still answer from the one found, a write
+        // would land in the wrong one.
+        ...(stalled.length
+          ? {
+              writeRefused: `${stalled.map((p) => `127.0.0.1:${p}`).join(', ')} accepted a connection but did not answer /api/v1/health, so it is not certain ${target.url} is the cockpit for ${options.cwd} — nothing was sent; pass --url (or set CEZ_API_URL) to name the cockpit, or try again once ${stalled.length > 1 ? 'they answer' : 'it answers'}`,
             }
           : {}),
       },
