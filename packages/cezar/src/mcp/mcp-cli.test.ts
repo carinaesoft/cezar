@@ -2,6 +2,7 @@ import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Client, InMemoryTransport, ReadBuffer, serializeMessage, type JSONRPCMessage, type Transport } from '@modelcontextprotocol/client';
 import type { McpServerFactory } from '@modelcontextprotocol/server';
+import { longDeadline, type CezarFetch as CezarFetchLike } from './api.ts';
 import {
   createCockpitResolver,
   discoverCockpit,
@@ -15,42 +16,85 @@ import {
  *  tests (`tools.test.ts`, `tools.routes.test.ts`). */
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
-const health = () => json({ version: '0.15.0', capabilities: {}, repoRoot: '/x' });
+const health = (repoRoot = 'x') => json({ version: '0.15.0', capabilities: {}, repoRoot });
 
-/** A fetch answering like cockpits on the given ports, each serving the given project roots. */
-function cockpits(byPort: Record<number, Array<{ id: string; root: string }>>, probed: string[] = []) {
+type Project = { id: string; root: string };
+
+/**
+ * A fetch answering like cockpits on the given ports. Like real cockpits on one machine they share
+ * ONE project registry (`~/.cezar`); what differs is the project each was booted in. A port may
+ * instead carry its own registry, as a cockpit with its own `CEZ_HOME` does.
+ */
+function cockpits(
+  shared: Project[],
+  bootByPort: Record<number, string | { boot: string; registry: Project[] }>,
+  probed: string[] = [],
+) {
   return async (input: string | URL | Request) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     probed.push(url.href);
-    const projects = byPort[Number(url.port)];
-    if (!projects) throw new TypeError('fetch failed');
+    const entry = bootByPort[Number(url.port)];
+    if (entry === undefined) throw new TypeError('fetch failed');
+    const { boot, registry } = typeof entry === 'string' ? { boot: entry, registry: shared } : entry;
     if (url.pathname === '/api/v1/health') return health();
-    if (url.pathname === '/api/v1/projects') return json({ bootProject: projects[0]?.id ?? 'x', projectsDir: '/', projects });
+    if (url.pathname === '/api/v1/projects') return json({ bootProject: boot, projectsDir: '/', projects: registry });
     return json({ error: 'not found' }, 404);
   };
 }
 
+const REGISTRY: Project[] = [
+  { id: 'other', root: '/work/other' },
+  { id: 'mono', root: '/work/mono' },
+  { id: 'pkg', root: '/work/mono/packages/pkg' },
+];
+
 describe('cockpit discovery', () => {
   it('probes 4321–4370 and takes the only cockpit, whatever it serves', async () => {
     const probed: string[] = [];
-    expect(await discoverCockpit(cockpits({ 4330: [{ id: 'a', root: '/work/a' }] }, probed), '/elsewhere')).toEqual({ url: 'http://127.0.0.1:4330' });
+    expect(await discoverCockpit(cockpits([{ id: 'a', root: '/work/a' }], { 4330: 'a' }, probed), '/elsewhere')).toEqual({ url: 'http://127.0.0.1:4330' });
     expect(probed).toContain('http://127.0.0.1:4321/api/v1/health');
     expect(probed).toContain('http://127.0.0.1:4370/api/v1/health');
     expect(probed).not.toContain('http://127.0.0.1:4371/api/v1/health');
   });
 
-  it('with several cockpits, takes the one with a project holding the cwd, and that project', async () => {
-    const fetchImpl = cockpits({
-      4321: [{ id: 'other', root: '/work/other' }],
-      4322: [
-        { id: 'mono', root: '/work/mono' },
-        { id: 'pkg', root: '/work/mono/packages/pkg' },
-      ],
-    });
-    expect(await discoverCockpit(fetchImpl, '/work/mono/packages/pkg/src')).toEqual({ url: 'http://127.0.0.1:4322', projectId: 'pkg' });
+  it('with several cockpits on one shared registry, takes the one booted deepest around the cwd', async () => {
+    // Every cockpit "has" every project; only the boot project tells them apart.
+    const fetchImpl = cockpits(REGISTRY, { 4321: 'other', 4322: 'mono', 4323: 'pkg' });
+    expect(await discoverCockpit(fetchImpl, '/work/mono/packages/pkg/src')).toEqual({ url: 'http://127.0.0.1:4323', projectId: 'pkg' });
     expect(await discoverCockpit(fetchImpl, '/work/mono/docs')).toEqual({ url: 'http://127.0.0.1:4322', projectId: 'mono' });
+    expect(await discoverCockpit(fetchImpl, '/work/other')).toEqual({ url: 'http://127.0.0.1:4321', projectId: 'other' });
     // a sibling whose name merely starts the same is not inside the root
-    await expect(discoverCockpit(fetchImpl, '/work/monorepo')).rejects.toThrow(/several cezar cockpits.*--url/);
+    await expect(discoverCockpit(fetchImpl, '/work/monorepo')).rejects.toThrow(/several cezar cockpits.*none was started in \/work\/monorepo.*--url/);
+  });
+
+  it('a project no cockpit was booted in is ambiguous, not the lowest port', async () => {
+    const fetchImpl = cockpits(REGISTRY, { 4321: 'other', 4322: 'pkg' });
+    await expect(discoverCockpit(fetchImpl, '/work/mono/docs')).rejects.toThrow(/several cezar cockpits.*--url/);
+  });
+
+  it('two cockpits booted in the same project are ambiguous', async () => {
+    const fetchImpl = cockpits(REGISTRY, { 4321: 'mono', 4345: 'mono' });
+    await expect(discoverCockpit(fetchImpl, '/work/mono')).rejects.toThrow(
+      /http:\/\/127\.0\.0\.1:4321 and http:\/\/127\.0\.0\.1:4345 were all started in \/work\/mono — pass --url/,
+    );
+  });
+
+  it('cockpits with separate registries: the only one holding the cwd', async () => {
+    const fetchImpl = cockpits([], {
+      4321: { boot: 'x', registry: [{ id: 'x', root: '/work/x' }] },
+      4322: { boot: 'y', registry: [{ id: 'y', root: '/work/y' }, { id: 'z', root: '/work/z' }] },
+    });
+    expect(await discoverCockpit(fetchImpl, '/work/z/src')).toEqual({ url: 'http://127.0.0.1:4322', projectId: 'z' });
+  });
+
+  it('a cockpit booted in an unregistered root is matched by its /health repoRoot', async () => {
+    const fetchImpl = async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.port !== '4321' && url.port !== '4322') throw new TypeError('fetch failed');
+      if (url.pathname === '/api/v1/health') return health(url.port === '4322' ? '/work/wt' : '/work/other');
+      return json({ bootProject: url.port === '4322' ? 'wt' : 'other', projectsDir: '/', projects: [{ id: 'other', root: '/work/other' }] });
+    };
+    expect(await discoverCockpit(fetchImpl, '/work/wt/src')).toEqual({ url: 'http://127.0.0.1:4322' });
   });
 
   it('ignores a port that answers but is not a cockpit', async () => {
@@ -64,22 +108,22 @@ describe('cockpit discovery', () => {
   });
 
   it('with nothing listening, says how to fix it', async () => {
-    await expect(discoverCockpit(cockpits({}), '/')).rejects.toThrow(/no cezar cockpit found on 127\.0\.0\.1:4321-4370.*--url/);
+    await expect(discoverCockpit(cockpits([], {}), '/')).rejects.toThrow(/no cezar cockpit found on 127\.0\.0\.1:4321-4370.*--url/);
   });
 });
 
 describe('cockpit resolver', () => {
   it('discovers again after a connection error — a cockpit restarted on another port is found', async () => {
-    const ports: Record<number, Array<{ id: string; root: string }>> = { 4321: [{ id: 'p', root: '/r' }] };
+    const ports: Record<number, string> = { 4321: 'p' };
     const requested: string[] = [];
-    const resolve = createCockpitResolver({ fetch: cockpits(ports, requested), cwd: '/r' });
+    const resolve = createCockpitResolver({ fetch: cockpits([{ id: 'p', root: '/r' }], ports, requested), cwd: '/r' });
     const first = await resolve();
     expect(first.defaultProjectId).toBe('p');
     expect(await resolve()).toBe(first);
     expect((await first.api.api.v1.projects.$get()).status).toBe(200);
 
     delete ports[4321];
-    ports[4340] = [{ id: 'p', root: '/r' }];
+    ports[4340] = 'p';
     await expect(first.api.api.v1.projects.$get()).rejects.toThrow('fetch failed');
     const second = await resolve();
     expect(second).not.toBe(first);
@@ -87,11 +131,38 @@ describe('cockpit resolver', () => {
     expect(requested.at(-1)).toBe('http://127.0.0.1:4340/api/v1/projects');
   });
 
-  it('an explicit URL is never probed for, and --project wins over the cwd', async () => {
+  it('two concurrent first calls share one discovery', async () => {
+    const probed: string[] = [];
+    const resolve = createCockpitResolver({ fetch: cockpits([{ id: 'p', root: '/r' }], { 4321: 'p' }, probed), cwd: '/r' });
+    const [a, b] = await Promise.all([resolve(), resolve()]);
+    expect(a).toBe(b);
+    expect(probed.filter((u) => u === 'http://127.0.0.1:4321/api/v1/health')).toHaveLength(1);
+  });
+
+  it('a failed discovery is not kept: the next call tries again', async () => {
+    const ports: Record<number, string> = {};
+    const resolve = createCockpitResolver({ fetch: cockpits([{ id: 'p', root: '/r' }], ports), cwd: '/r' });
+    await expect(resolve()).rejects.toThrow(/no cezar cockpit found/);
+    ports[4321] = 'p';
+    expect((await resolve()).defaultProjectId).toBe('p');
+  });
+
+  it('an explicit URL is never probed for, and still serves the project holding the cwd', async () => {
+    const probed: string[] = [];
+    const fetchImpl = cockpits(REGISTRY, { 4999: 'other' }, probed);
+    const resolve = createCockpitResolver({ fetch: fetchImpl, cwd: '/work/mono/packages/pkg', explicitUrl: 'http://127.0.0.1:4999' });
+    expect((await resolve()).defaultProjectId).toBe('pkg');
+    expect(probed).toEqual(['http://127.0.0.1:4999/api/v1/projects']);
+    // no project holds the cwd: the boot project
+    const outside = createCockpitResolver({ fetch: fetchImpl, cwd: '/tmp/elsewhere', explicitUrl: 'http://127.0.0.1:4999' });
+    expect((await outside()).defaultProjectId).toBe('default');
+  });
+
+  it('--project wins over the cwd, without asking the registry', async () => {
     const probed: string[] = [];
     const resolve = createCockpitResolver({
-      fetch: cockpits({ 4999: [] }, probed),
-      cwd: '/r',
+      fetch: cockpits(REGISTRY, { 4999: 'other' }, probed),
+      cwd: '/work/mono',
       explicitUrl: 'http://127.0.0.1:4999',
       projectId: 'mine',
     });
@@ -99,9 +170,37 @@ describe('cockpit resolver', () => {
     expect(probed).toEqual([]);
   });
 
+  it('a request keeps its deadline when the caller passes a signal of its own', async () => {
+    const stall: CezarFetchLike = (_input, init) =>
+      new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal?.reason)));
+    const resolve = createCockpitResolver({ fetch: stall, cwd: '/', explicitUrl: 'http://127.0.0.1:4999', projectId: 'p', requestTimeoutMs: 100 });
+    const { api } = await resolve();
+    const never = new AbortController();
+    const started = Date.now();
+    await expect(api.api.v1.projects.$get(undefined, { init: { signal: never.signal } })).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it('a longDeadline signal is not shortened by the default deadline', async () => {
+    const seen: AbortSignal[] = [];
+    const resolve = createCockpitResolver({
+      fetch: async (_input, init) => {
+        seen.push(init!.signal!);
+        return json({});
+      },
+      cwd: '/',
+      explicitUrl: 'http://127.0.0.1:4999',
+      projectId: 'p',
+    });
+    const { api } = await resolve();
+    const long = longDeadline(30_000);
+    await api.api.v1.projects.$get(undefined, { init: { signal: long } });
+    expect(seen[0]).toBe(long);
+  });
+
   it('inside a cezar task without CEZ_API_URL, it does not probe: the cockpit withheld the address', async () => {
     const probed: string[] = [];
-    const resolve = createCockpitResolver({ fetch: cockpits({ 4321: [] }, probed), cwd: '/', insideTask: true });
+    const resolve = createCockpitResolver({ fetch: cockpits([], { 4321: 'x' }, probed), cwd: '/', insideTask: true });
     await expect(resolve()).rejects.toThrow(/CEZ_API_URL is not set inside this cezar task/);
     expect(probed).toEqual([]);
   });
@@ -128,6 +227,8 @@ describe('cez mcp flags', () => {
   it('parses --header as "Name: value" and refuses anything else', () => {
     expect(parseHeader('Authorization: Basic abc:def')).toEqual(['Authorization', 'Basic abc:def']);
     expect(() => parseHeader('nocolon')).toThrow(/Name: value/);
+    expect(() => parseHeader(' : x')).toThrow(/Name: value/);
+    expect(() => parseHeader('Bad Name: x')).toThrow(/Name: value/);
   });
 
   it('--help prints usage and does not start the server', async () => {
@@ -138,7 +239,7 @@ describe('cez mcp flags', () => {
     expect(h.factories).toHaveLength(0);
   });
 
-  it.each([[['--nope']], [['--header', 'bad']], [['--url', 'ftp://x']]])('%j exits 2 without serving', async (args) => {
+  it.each([[['--nope']], [['--header', 'bad']], [['--header', ' : x']], [['--url', 'ftp://x']], [['--url', '']], [['--url', ' ']]])('%j exits 2 without serving', async (args) => {
     const h = io();
     expect(await runMcpCommand(args, {}, h.harness)).toBe(2);
     expect(h.factories).toHaveLength(0);

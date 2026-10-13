@@ -13,11 +13,11 @@
  */
 import { parseArgs } from 'node:util';
 import { readFileSync, realpathSync } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Readable, Writable } from 'node:stream';
 import type { McpServerFactory } from '@modelcontextprotocol/server';
-import { createApiClient, isConnectionError, type CezarFetch } from './api.ts';
+import { createApiClient, hasOwnDeadline, isConnectionError, type CezarFetch } from './api.ts';
 import { buildMcpServer, type Cockpit } from './tools.ts';
 
 export const DEFAULT_PORTS = { first: 4321, last: 4370 } as const;
@@ -59,8 +59,10 @@ export class NoCockpitError extends Error {
 /** `"Name: value"` → `[name, value]`; the header name is whatever precedes the first colon. */
 export function parseHeader(raw: string): [string, string] {
   const colon = raw.indexOf(':');
-  if (colon <= 0) throw new Error(`--header must look like "Name: value", got "${raw}"`);
-  return [raw.slice(0, colon).trim(), raw.slice(colon + 1).trim()];
+  const name = colon < 0 ? '' : raw.slice(0, colon).trim();
+  // An HTTP token (RFC 9110 §5.6.2): fetch would throw on anything else, at the first tool call.
+  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) throw new Error(`--header must look like "Name: value", got "${raw}"`);
+  return [name, raw.slice(colon + 1).trim()];
 }
 
 export interface DiscoveredCockpit {
@@ -77,59 +79,84 @@ function canonical(path: string): string {
   }
 }
 
-/** The deepest registered root that contains `cwd` (a repo nested in another wins). */
-async function projectHolding(fetchImpl: CezarFetch, url: string, cwd: string, headers?: Record<string, string>) {
+const inside = (cwd: string, root: string) => cwd === root || cwd.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
+
+interface Registry {
+  /** The registered project holding `cwd` — the deepest root wins, so a repo nested in another does. */
+  holding?: { id: string; root: string };
+  /** The root of the project the cockpit was booted in, when the registry lists it. */
+  bootRoot?: string;
+}
+
+async function readRegistry(fetchImpl: CezarFetch, url: string, cwd: string, timeoutMs: number, headers?: Record<string, string>): Promise<Registry> {
   try {
-    const res = await fetchImpl(`${url}/api/v1/projects`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS), ...(headers ? { headers } : {}) });
-    if (!res.ok) return undefined;
-    const body = (await res.json()) as { projects?: Array<{ id?: unknown; root?: unknown }> };
-    const roots = (body.projects ?? []).flatMap((p) =>
-      typeof p.id === 'string' && typeof p.root === 'string' && (cwd === p.root || cwd.startsWith(p.root.endsWith(sep) ? p.root : `${p.root}${sep}`))
-        ? [{ id: p.id, root: p.root }]
-        : [],
-    );
-    return roots.sort((a, b) => b.root.length - a.root.length)[0]?.id;
+    const res = await fetchImpl(`${url}/api/v1/projects`, { signal: AbortSignal.timeout(timeoutMs), ...(headers ? { headers } : {}) });
+    if (!res.ok) return {};
+    const body = (await res.json()) as { bootProject?: unknown; projects?: Array<{ id?: unknown; root?: unknown }> };
+    const projects = (body.projects ?? []).flatMap((p) => (typeof p.id === 'string' && typeof p.root === 'string' ? [{ id: p.id, root: p.root }] : []));
+    const holding = projects.filter((p) => inside(cwd, p.root)).sort((a, b) => b.root.length - a.root.length)[0];
+    const bootRoot = projects.find((p) => p.id === body.bootProject)?.root;
+    return { ...(holding ? { holding } : {}), ...(bootRoot ? { bootRoot } : {}) };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
 /**
  * Probe every port the cockpit may have picked, in parallel, and keep the ones answering like a
- * cockpit (`version` + `capabilities`). One cockpit is the answer. With several, the one with a
- * project holding `cwd` is; when none does, guessing would send writes to whichever cockpit owns
- * the lowest port (#1000), so the user is asked to choose with `--url`.
+ * cockpit (`version` + `capabilities`). One cockpit is the answer. Cockpits on one machine share
+ * the project registry (`~/.cezar`), so every one of them "has" the project holding `cwd`; what
+ * tells them apart is where each was BOOTED. The cockpit booted deepest around `cwd` wins; a tie,
+ * or several cockpits none of which was booted around `cwd`, is the user's choice (`--url`) —
+ * guessing would send writes to whichever cockpit owns the lowest port (#1000).
  */
 export async function discoverCockpit(fetchImpl: CezarFetch, cwd: string, headers?: Record<string, string>): Promise<DiscoveredCockpit> {
   const ports: number[] = [];
   for (let p = DEFAULT_PORTS.first; p <= DEFAULT_PORTS.last; p += 1) ports.push(p);
   const probes = await Promise.all(
-    ports.map(async (port): Promise<string | null> => {
+    ports.map(async (port): Promise<{ url: string; repoRoot?: string } | null> => {
       const url = `http://127.0.0.1:${port}`;
       try {
         const res = await fetchImpl(`${url}/api/v1/health`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return null;
-        const body = (await res.json()) as { version?: unknown; capabilities?: unknown };
-        return typeof body.version === 'string' && body.capabilities && typeof body.capabilities === 'object' ? url : null;
+        const body = (await res.json()) as { version?: unknown; capabilities?: unknown; repoRoot?: unknown };
+        if (typeof body.version !== 'string' || !body.capabilities || typeof body.capabilities !== 'object') return null;
+        // Absolute in local mode only (a hosted cockpit trims it to a basename, #431).
+        return { url, ...(typeof body.repoRoot === 'string' && isAbsolute(body.repoRoot) ? { repoRoot: body.repoRoot } : {}) };
       } catch {
         return null;
       }
     }),
   );
-  const found = probes.filter((url): url is string => url !== null);
+  const live = probes.filter((p): p is { url: string; repoRoot?: string } => p !== null);
+  const found = live.map((p) => p.url);
   if (found.length === 0) {
     throw new NoCockpitError(
       `no cezar cockpit found on 127.0.0.1:${DEFAULT_PORTS.first}-${DEFAULT_PORTS.last} — start one with \`npx cezar-run\` in your repo, or pass --url / set CEZ_API_URL`,
     );
   }
   const here = canonical(cwd);
-  const matches = await Promise.all(found.map(async (url) => ({ url, projectId: await projectHolding(fetchImpl, url, here, headers) })));
-  const mine = matches.filter((m) => m.projectId !== undefined);
-  if (mine.length >= 1) return mine[0]!;
-  if (found.length === 1) return { url: found[0]! };
-  throw new NoCockpitError(
-    `several cezar cockpits are running (${found.join(', ')}) and none serves ${here} — pass --url or set CEZ_API_URL to choose one`,
+  const cockpits = await Promise.all(
+    live.map(async ({ url, repoRoot }) => {
+      const registry = await readRegistry(fetchImpl, url, here, PROBE_TIMEOUT_MS, headers);
+      // A cockpit booted in an unregistered root (a task worktree) still names it on /health.
+      return { url, ...registry, ...(registry.bootRoot || !repoRoot ? {} : { bootRoot: repoRoot }) };
+    }),
   );
+  const answer = (c: (typeof cockpits)[number]): DiscoveredCockpit => ({ url: c.url, ...(c.holding ? { projectId: c.holding.id } : {}) });
+  if (cockpits.length === 1) return answer(cockpits[0]!);
+  const bootedAround = cockpits
+    .filter((c) => c.bootRoot && inside(here, c.bootRoot))
+    .sort((a, b) => b.bootRoot!.length - a.bootRoot!.length);
+  const [best, next] = bootedAround;
+  if (best && (!next || next.bootRoot!.length < best.bootRoot!.length)) return answer(best);
+  // Cockpits with separate homes (CEZ_HOME) do not share a registry: then holding the cwd tells.
+  const holders = cockpits.filter((c) => c.holding);
+  if (!best && holders.length === 1) return answer(holders[0]!);
+  const why = best
+    ? `${bootedAround.filter((c) => c.bootRoot === best.bootRoot).map((c) => c.url).join(' and ')} were all started in ${best.bootRoot}`
+    : `none was started in ${here} or a directory above it`;
+  throw new NoCockpitError(`several cezar cockpits are running (${found.join(', ')}) and ${why} — pass --url or set CEZ_API_URL to choose one`);
 }
 
 export interface CockpitResolverOptions {
@@ -140,35 +167,56 @@ export interface CockpitResolverOptions {
   headers?: Record<string, string>;
   /** Inside a cezar task an absent `CEZ_API_URL` means the cockpit withheld it (cockpit-address.ts). */
   insideTask?: boolean;
+  /** Per-request deadline; tests shorten it. */
+  requestTimeoutMs?: number;
 }
 
 /**
  * The address, found once and kept until a request cannot reach it — then dropped, so the next
- * call discovers again instead of talking to a dead port forever.
+ * call discovers again instead of talking to a dead port forever. Concurrent first calls share one
+ * discovery.
  */
 export function createCockpitResolver(options: CockpitResolverOptions): () => Promise<Cockpit> {
-  let current: Cockpit | undefined;
+  let current: Promise<Cockpit> | undefined;
+  const deadlineMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   const fetchWithDeadline: CezarFetch = async (input, init) => {
+    // The caller's signal (a wait's abort, a client cancel) never lifts the default deadline,
+    // unless it is a deadline of its own (`longDeadline`).
+    const caller = init?.signal;
+    const signal = caller && hasOwnDeadline(caller) ? caller : AbortSignal.any([AbortSignal.timeout(deadlineMs), ...(caller ? [caller] : [])]);
     try {
-      return await options.fetch(input, init?.signal ? init : { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      return await options.fetch(input, { ...init, signal });
     } catch (error) {
       if (isConnectionError(error)) current = undefined;
       throw error;
     }
   };
-  return async () => {
-    if (current) return current;
+  const resolveOnce = async (): Promise<Cockpit> => {
     let target: DiscoveredCockpit;
-    if (options.explicitUrl) target = { url: options.explicitUrl };
-    else if (options.insideTask) {
+    if (options.explicitUrl) {
+      // An explicit address still serves the project holding the cwd, like a discovered one.
+      const registry = options.projectId ? {} : await readRegistry(options.fetch, options.explicitUrl, canonical(options.cwd), deadlineMs, options.headers);
+      target = { url: options.explicitUrl, ...(registry.holding ? { projectId: registry.holding.id } : {}) };
+    } else if (options.insideTask) {
       throw new NoCockpitError(
         'CEZ_API_URL is not set inside this cezar task, so the cockpit withheld its address — pass --url only if you were told to; otherwise stop and report',
       );
     } else target = await discoverCockpit(options.fetch, options.cwd, options.headers);
-    current = {
+    return {
       api: createApiClient({ baseUrl: target.url, fetch: fetchWithDeadline, ...(options.headers ? { headers: options.headers } : {}) }),
+      // No project holds the cwd: `default`, the cockpit's boot project.
       defaultProjectId: options.projectId ?? target.projectId ?? 'default',
     };
+  };
+  return () => {
+    if (!current) {
+      const pending = resolveOnce();
+      current = pending;
+      // A failed discovery is not cached: the next call tries again.
+      pending.catch(() => {
+        if (current === pending) current = undefined;
+      });
+    }
     return current;
   };
 }
@@ -248,7 +296,12 @@ export async function runMcpCommand(
     io.error(`cez mcp: ${(error as Error).message}`);
     return 2;
   }
-  const explicitUrl = (values.url ?? env.CEZ_API_URL)?.replace(/\/+$/, '') || undefined;
+  if (values.url !== undefined && values.url.trim() === '') {
+    io.error('cez mcp: --url is empty — pass a cockpit address, or leave --url out to find one');
+    return 2;
+  }
+  // An empty CEZ_API_URL reads as unset, as everywhere else in cezar.
+  const explicitUrl = (values.url ?? env.CEZ_API_URL)?.trim().replace(/\/+$/, '') || undefined;
   if (explicitUrl && !/^https?:\/\//.test(explicitUrl)) {
     io.error(`cez mcp: --url / CEZ_API_URL must be an http(s) URL, got "${explicitUrl}"`);
     return 2;

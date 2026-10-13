@@ -56,6 +56,20 @@ export async function readJson<R extends ClientResponse<unknown, number, string>
   throw new CezarApiError(res.status, reason);
 }
 
+const ownDeadlines = new WeakSet<AbortSignal>();
+
+/** A timeout signal the resolver's default request deadline must not shorten (`GET /models` may
+ *  wait on a vendor CLI past it). Any other signal is combined with that deadline. */
+export function longDeadline(ms: number): AbortSignal {
+  const signal = AbortSignal.timeout(ms);
+  ownDeadlines.add(signal);
+  return signal;
+}
+
+export function hasOwnDeadline(signal: AbortSignal): boolean {
+  return ownDeadlines.has(signal);
+}
+
 /** `fetch` could not reach the cockpit at all (refused, reset, DNS) — as opposed to an HTTP answer
  *  or our own abort. Undici reports every one of those as `TypeError('fetch failed')`. */
 export function isConnectionError(error: unknown): boolean {
