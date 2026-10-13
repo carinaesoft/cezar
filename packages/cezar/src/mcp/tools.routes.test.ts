@@ -106,8 +106,8 @@ describe('cez mcp tools over the real /api/v1 router', () => {
     for (const name of ['get_run', 'get_run_status', 'list_run_events', 'cancel_run']) {
       const result = await call(name, { runId: 'nope' });
       expect(result.isError, name).toBe(true);
-      // the real index does not list it either, so the hint asks for its projectId
-      expect(text(result), name).toBe('cezar refused: 404: not found — run nope is not in the default project; pass its projectId (list_runs shows it)');
+      // the real index does not list it either: no project has it
+      expect(text(result), name).toBe('cezar refused: 404: not found — no project of this cockpit has a run nope — check the id (list_runs)');
     }
   });
 

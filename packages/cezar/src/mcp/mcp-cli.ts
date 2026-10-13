@@ -24,6 +24,8 @@ export const DEFAULT_PORTS = { first: 4321, last: 4370 } as const;
 /** Same bound as `cez runs`: a stalled cockpit or proxy must not hang an agent's tool call. */
 const REQUEST_TIMEOUT_MS = 10_000;
 const PROBE_TIMEOUT_MS = 800;
+/** A second, longer chance for a port that accepted the connection but missed the first. */
+const PROBE_RETRY_TIMEOUT_MS = 3_000;
 
 const USAGE = `cez mcp — MCP server (stdio) for a running cezar cockpit
 
@@ -69,6 +71,13 @@ export interface DiscoveredCockpit {
   url: string;
   /** The registered project holding `cwd`, when the cockpit has one. */
   projectId?: string;
+  /** The id of the project the cockpit was booted in, when its registry was read. */
+  bootProject?: string;
+  /** This cockpit's project registry could not be read, and why. */
+  registryUnread?: string;
+  /** What the choice was made without — a port that stalled, a registry that failed. Such an
+   *  answer is used once and not kept. */
+  incomplete?: string[];
 }
 
 function canonical(path: string): string {
@@ -84,21 +93,30 @@ const inside = (cwd: string, root: string) => cwd === root || cwd.startsWith(roo
 interface Registry {
   /** The registered project holding `cwd` — the deepest root wins, so a repo nested in another does. */
   holding?: { id: string; root: string };
-  /** The root of the project the cockpit was booted in, when the registry lists it. */
+  /** The id and root of the project the cockpit was booted in, when the registry lists it. */
+  bootProject?: string;
   bootRoot?: string;
+  /** The registry could not be read, and why: which project holds `cwd` is then unknown. */
+  failed?: string;
 }
+
+const isTimeout = (error: unknown) => error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
 
 async function readRegistry(fetchImpl: CezarFetch, url: string, cwd: string, timeoutMs: number, headers?: Record<string, string>): Promise<Registry> {
   try {
     const res = await fetchImpl(`${url}/api/v1/projects`, { signal: AbortSignal.timeout(timeoutMs), ...(headers ? { headers } : {}) });
-    if (!res.ok) return {};
-    const body = (await res.json()) as { bootProject?: unknown; projects?: Array<{ id?: unknown; root?: unknown }> };
-    const projects = (body.projects ?? []).flatMap((p) => (typeof p.id === 'string' && typeof p.root === 'string' ? [{ id: p.id, root: p.root }] : []));
+    if (!res.ok) return { failed: `${res.status} ${res.statusText}`.trim() };
+    const body = (await res.json()) as { bootProject?: unknown; projects?: unknown };
+    if (!Array.isArray(body.projects)) return { failed: 'not a project list' };
+    const projects = (body.projects as Array<{ id?: unknown; root?: unknown }>).flatMap((p) =>
+      typeof p.id === 'string' && typeof p.root === 'string' ? [{ id: p.id, root: p.root }] : [],
+    );
     const holding = projects.filter((p) => inside(cwd, p.root)).sort((a, b) => b.root.length - a.root.length)[0];
-    const bootRoot = projects.find((p) => p.id === body.bootProject)?.root;
-    return { ...(holding ? { holding } : {}), ...(bootRoot ? { bootRoot } : {}) };
-  } catch {
-    return {};
+    const bootProject = typeof body.bootProject === 'string' ? body.bootProject : undefined;
+    const bootRoot = projects.find((p) => p.id === bootProject)?.root;
+    return { ...(holding ? { holding } : {}), ...(bootProject ? { bootProject } : {}), ...(bootRoot ? { bootRoot } : {}) };
+  } catch (error) {
+    return { failed: isTimeout(error) ? `no answer within ${timeoutMs} ms` : (error as Error).message };
   }
 }
 
@@ -111,39 +129,54 @@ async function readRegistry(fetchImpl: CezarFetch, url: string, cwd: string, tim
  * guessing would send writes to whichever cockpit owns the lowest port (#1000).
  */
 export async function discoverCockpit(fetchImpl: CezarFetch, cwd: string, headers?: Record<string, string>): Promise<DiscoveredCockpit> {
+  type Probe = { url: string; repoRoot?: string } | 'stalled' | null;
+  const probe = async (port: number, timeoutMs: number): Promise<Probe> => {
+    const url = `http://127.0.0.1:${port}`;
+    try {
+      const res = await fetchImpl(`${url}/api/v1/health`, { signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) return null;
+      const body = (await res.json()) as { version?: unknown; capabilities?: unknown; repoRoot?: unknown };
+      if (typeof body.version !== 'string' || !body.capabilities || typeof body.capabilities !== 'object') return null;
+      // Absolute in local mode only (a hosted cockpit trims it to a basename, #431).
+      return { url, ...(typeof body.repoRoot === 'string' && isAbsolute(body.repoRoot) ? { repoRoot: body.repoRoot } : {}) };
+    } catch (error) {
+      // On loopback a closed port refuses at once; running out of time means something accepted
+      // the connection and did not answer — a busy or stopped cockpit.
+      return isTimeout(error) ? 'stalled' : null;
+    }
+  };
   const ports: number[] = [];
   for (let p = DEFAULT_PORTS.first; p <= DEFAULT_PORTS.last; p += 1) ports.push(p);
-  const probes = await Promise.all(
-    ports.map(async (port): Promise<{ url: string; repoRoot?: string } | null> => {
-      const url = `http://127.0.0.1:${port}`;
-      try {
-        const res = await fetchImpl(`${url}/api/v1/health`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
-        if (!res.ok) return null;
-        const body = (await res.json()) as { version?: unknown; capabilities?: unknown; repoRoot?: unknown };
-        if (typeof body.version !== 'string' || !body.capabilities || typeof body.capabilities !== 'object') return null;
-        // Absolute in local mode only (a hosted cockpit trims it to a basename, #431).
-        return { url, ...(typeof body.repoRoot === 'string' && isAbsolute(body.repoRoot) ? { repoRoot: body.repoRoot } : {}) };
-      } catch {
-        return null;
-      }
-    }),
-  );
-  const live = probes.filter((p): p is { url: string; repoRoot?: string } => p !== null);
+  const first = await Promise.all(ports.map((port) => probe(port, PROBE_TIMEOUT_MS)));
+  // Only a port that stalled is asked again, with more time: the fast path pays nothing.
+  const probes = await Promise.all(first.map((p, i) => (p === 'stalled' ? probe(ports[i]!, PROBE_RETRY_TIMEOUT_MS) : p)));
+  const stalled = ports.filter((_, i) => probes[i] === 'stalled');
+  const incomplete = stalled.map((port) => `127.0.0.1:${port} accepted a connection but did not answer /api/v1/health within ${PROBE_RETRY_TIMEOUT_MS} ms`);
+  const live = probes.filter((p): p is { url: string; repoRoot?: string } => p !== null && p !== 'stalled');
   const found = live.map((p) => p.url);
   if (found.length === 0) {
     throw new NoCockpitError(
-      `no cezar cockpit found on 127.0.0.1:${DEFAULT_PORTS.first}-${DEFAULT_PORTS.last} — start one with \`npx cezar-run\` in your repo, or pass --url / set CEZ_API_URL`,
+      stalled.length
+        ? `no cezar cockpit answered on 127.0.0.1:${DEFAULT_PORTS.first}-${DEFAULT_PORTS.last}: ${incomplete.join('; ')} — is that cockpit stopped or overloaded? Pass --url / set CEZ_API_URL to name one`
+        : `no cezar cockpit found on 127.0.0.1:${DEFAULT_PORTS.first}-${DEFAULT_PORTS.last} — start one with \`npx cezar-run\` in your repo, or pass --url / set CEZ_API_URL`,
     );
   }
   const here = canonical(cwd);
   const cockpits = await Promise.all(
     live.map(async ({ url, repoRoot }) => {
-      const registry = await readRegistry(fetchImpl, url, here, PROBE_TIMEOUT_MS, headers);
+      const registry = await readRegistry(fetchImpl, url, here, PROBE_RETRY_TIMEOUT_MS, headers);
+      if (registry.failed) incomplete.push(`${url} did not list its projects (${registry.failed})`);
       // A cockpit booted in an unregistered root (a task worktree) still names it on /health.
       return { url, ...registry, ...(registry.bootRoot || !repoRoot ? {} : { bootRoot: repoRoot }) };
     }),
   );
-  const answer = (c: (typeof cockpits)[number]): DiscoveredCockpit => ({ url: c.url, ...(c.holding ? { projectId: c.holding.id } : {}) });
+  const answer = (c: (typeof cockpits)[number]): DiscoveredCockpit => ({
+    url: c.url,
+    ...(c.holding ? { projectId: c.holding.id } : {}),
+    ...(c.bootProject ? { bootProject: c.bootProject } : {}),
+    ...(c.failed ? { registryUnread: c.failed } : {}),
+    ...(incomplete.length ? { incomplete } : {}),
+  });
   if (cockpits.length === 1) return answer(cockpits[0]!);
   const bootedAround = cockpits
     .filter((c) => c.bootRoot && inside(here, c.bootRoot))
@@ -169,12 +202,15 @@ export interface CockpitResolverOptions {
   insideTask?: boolean;
   /** Per-request deadline; tests shorten it. */
   requestTimeoutMs?: number;
+  /** Diagnostics (stderr): what a discovery had to do without. */
+  warn?: (line: string) => void;
 }
 
 /**
  * The address, found once and kept until a request cannot reach it — then dropped, so the next
  * call discovers again instead of talking to a dead port forever. Concurrent first calls share one
- * discovery.
+ * discovery. An answer made without part of the picture (a stalled port, an unread registry) is
+ * used for that call only, so a passing hiccup cannot pin the session to a guess.
  */
 export function createCockpitResolver(options: CockpitResolverOptions): () => Promise<Cockpit> {
   let current: Promise<Cockpit> | undefined;
@@ -191,31 +227,53 @@ export function createCockpitResolver(options: CockpitResolverOptions): () => Pr
       throw error;
     }
   };
-  const resolveOnce = async (): Promise<Cockpit> => {
+  const resolveOnce = async (): Promise<{ cockpit: Cockpit; keep: boolean }> => {
     let target: DiscoveredCockpit;
     if (options.explicitUrl) {
       // An explicit address still serves the project holding the cwd, like a discovered one.
-      const registry = options.projectId ? {} : await readRegistry(options.fetch, options.explicitUrl, canonical(options.cwd), deadlineMs, options.headers);
-      target = { url: options.explicitUrl, ...(registry.holding ? { projectId: registry.holding.id } : {}) };
+      const registry: Registry = options.projectId
+        ? {}
+        : await readRegistry(options.fetch, options.explicitUrl, canonical(options.cwd), deadlineMs, options.headers);
+      target = {
+        url: options.explicitUrl,
+        ...(registry.holding ? { projectId: registry.holding.id } : {}),
+        ...(registry.bootProject ? { bootProject: registry.bootProject } : {}),
+        ...(registry.failed ? { registryUnread: registry.failed, incomplete: [`${options.explicitUrl} did not list its projects (${registry.failed})`] } : {}),
+      };
     } else if (options.insideTask) {
       throw new NoCockpitError(
         'CEZ_API_URL is not set inside this cezar task, so the cockpit withheld its address — pass --url only if you were told to; otherwise stop and report',
       );
     } else target = await discoverCockpit(options.fetch, options.cwd, options.headers);
+    const incomplete = target.incomplete ?? [];
+    for (const line of incomplete) options.warn?.(`${line} — used ${target.url} for this call only, will look again on the next`);
+    // Without the registry the project holding the cwd is unknown: reads fall back to the boot
+    // project, a write must not guess (start_run, re-QA of #1109).
+    const unknown = !options.projectId && target.registryUnread;
     return {
-      api: createApiClient({ baseUrl: target.url, fetch: fetchWithDeadline, ...(options.headers ? { headers: options.headers } : {}) }),
-      // No project holds the cwd: `default`, the cockpit's boot project.
-      defaultProjectId: options.projectId ?? target.projectId ?? 'default',
+      cockpit: {
+        api: createApiClient({ baseUrl: target.url, fetch: fetchWithDeadline, ...(options.headers ? { headers: options.headers } : {}) }),
+        // No project holds the cwd: the cockpit's boot project.
+        defaultProjectId: options.projectId ?? target.projectId ?? target.bootProject ?? 'default',
+        ...(unknown
+          ? {
+              projectUnknown: `could not read the project list of ${target.url} (${target.registryUnread}), so which project holds ${options.cwd} is unknown — pass projectId (list_projects), or try again`,
+            }
+          : {}),
+      },
+      keep: incomplete.length === 0,
     };
   };
   return () => {
     if (!current) {
       const pending = resolveOnce();
-      current = pending;
-      // A failed discovery is not cached: the next call tries again.
-      pending.catch(() => {
-        if (current === pending) current = undefined;
-      });
+      const cockpit = pending.then((r) => r.cockpit);
+      current = cockpit;
+      // A failed or partial discovery is not cached: the next call tries again.
+      const forget = () => {
+        if (current === cockpit) current = undefined;
+      };
+      pending.then((r) => (r.keep ? undefined : forget()), forget);
     }
     return current;
   };
@@ -314,6 +372,7 @@ export async function runMcpCommand(
     ...(projectId ? { projectId } : {}),
     ...(headers ? { headers } : {}),
     insideTask: Boolean(env.CEZ_TASK_ID),
+    warn: (line) => io.error(`cez mcp: ${line}`),
   });
   const options = { cockpit, version: readOwnVersion(), readOnly: values['read-only'] };
   await io.serve(() => buildMcpServer(options));

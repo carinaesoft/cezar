@@ -224,8 +224,8 @@ describe('cez mcp tools: reads', () => {
     );
     const a = await mcp.callTool({ name: 'get_run_status', arguments: { runId: 'r1' } });
     const b = await mcp.callTool({ name: 'get_run_status', arguments: { runId: 'r1', projectId: 'other' } });
-    expect(a.structuredContent).toEqual({ id: 'r1', status: 'running', title: 't-r1', workflow: 'quick-task', createdAt: '2026-10-13T10:00:00.000Z' });
-    expect((b.structuredContent as { status: string }).status).toBe('done');
+    expect(a.structuredContent).toEqual({ id: 'r1', projectId: 'default', status: 'running', title: 't-r1', workflow: 'quick-task', createdAt: '2026-10-13T10:00:00.000Z' });
+    expect(b.structuredContent).toMatchObject({ projectId: 'other', status: 'done' });
     expect(calls.map((c) => c.url.pathname)).toEqual(['/api/v1/p/default/runs/r1', '/api/v1/p/other/runs/r1']);
   });
 
@@ -281,10 +281,29 @@ describe('cez mcp tools: reads', () => {
       expect(calls.filter((c) => c.method === 'POST').map((c) => c.url.pathname)).toEqual(['/api/v1/p/default/runs/r1/cancel']);
     });
 
-    it('a run the index does not know either: the hint names projectId', async () => {
+    it('a run no project has: says so, instead of pointing at a projectId', async () => {
       const mcp = await connect({ 'GET /api/v1/workspace/runs-index': { body: { ...index.body, runs: [] } } });
       const result = await mcp.callTool({ name: 'get_run_status', arguments: { runId: 'r1' } });
-      expect(textOf(result)).toMatch(/not in the default project; pass its projectId/);
+      expect(textOf(result)).toBe('cezar refused: 404: not found — no project of this cockpit has a run r1 — check the id (list_runs)');
+    });
+
+    it('a run past the index cap may still exist: the hint names the capped projects', async () => {
+      const mcp = await connect({ 'GET /api/v1/workspace/runs-index': { body: { ...index.body, runs: [], truncated: ['p2'] } } });
+      const result = await mcp.callTool({ name: 'get_run_status', arguments: { runId: 'r1' } });
+      expect(textOf(result)).toMatch(/run r1 is in no project's recent runs \(older runs of p2 are not indexed\) — check the id, or pass its projectId$/);
+    });
+
+    it('without the index, the hint stays the generic one', async () => {
+      const mcp = await connect({ 'GET /api/v1/workspace/runs-index': { status: 500 } });
+      const result = await mcp.callTool({ name: 'get_run_status', arguments: { runId: 'r1' } });
+      expect(textOf(result)).toMatch(/run r1 is not in the default project; pass its projectId/);
+    });
+
+    it.each(['get_run_status', 'get_run', 'wait_for_runs'])('%s names the project it followed the run to', async (name) => {
+      const mcp = await connect(routes());
+      const result = await mcp.callTool({ name, arguments: name === 'wait_for_runs' ? { runIds: ['r1'] } : { runId: 'r1' } });
+      const body = result.structuredContent as { projectId?: string; runs?: Array<{ projectId?: string }> };
+      expect(body.runs?.[0]?.projectId ?? body.projectId).toBe('p2');
     });
   });
 
@@ -502,8 +521,42 @@ describe('cez mcp tools: start_run and cancel_run', () => {
       { calls },
     );
     const result = await mcp.callTool({ name: 'start_run', arguments: { workflow: 'quick-task', task: 'Fix it', runner: 'codex' } });
-    expect(result.structuredContent).toEqual({ id: 'r9', status: 'queued', title: 'Fix', workflow: 'quick-task', createdAt: '2026-10-13T10:00:00.000Z' });
+    expect(result.structuredContent).toEqual({
+      id: 'r9',
+      projectId: 'default',
+      status: 'queued',
+      title: 'Fix',
+      workflow: 'quick-task',
+      createdAt: '2026-10-13T10:00:00.000Z',
+    });
     expect(calls[0]?.body).toEqual({ workflow: 'quick-task', task: 'Fix it', runner: 'codex' });
+  });
+
+  it('start_run names the project the run went to', async () => {
+    const api = createApiClient({
+      baseUrl: 'http://127.0.0.1:4321',
+      fetch: stubFetch({ 'POST /api/v1/p/repob/runs': { status: 201, body: run('r9', 'queued') } }),
+    });
+    const mcp = await connect({}, { cockpit: async () => ({ api, defaultProjectId: 'repob' }) });
+    const result = await mcp.callTool({ name: 'start_run', arguments: { workflow: 'quick-task', task: 'x' } });
+    expect((result.structuredContent as { projectId: string }).projectId).toBe('repob');
+  });
+
+  it('start_run without projectId refuses when the project holding the cwd is unknown; with one it goes ahead', async () => {
+    const calls: Call[] = [];
+    const api = createApiClient({
+      baseUrl: 'http://127.0.0.1:4321',
+      fetch: stubFetch({ 'POST /api/v1/p/repob/runs': { status: 201, body: run('r9', 'queued') } }, calls),
+    });
+    const projectUnknown = 'could not read the project list of http://127.0.0.1:4321 (503), so which project holds /r is unknown — pass projectId';
+    const mcp = await connect({}, { cockpit: async () => ({ api, defaultProjectId: 'default', projectUnknown }) });
+    const refused = await mcp.callTool({ name: 'start_run', arguments: { workflow: 'quick-task', task: 'x' } });
+    expect(refused.isError).toBe(true);
+    expect(textOf(refused)).toBe(projectUnknown);
+    expect(calls).toEqual([]);
+    const named = await mcp.callTool({ name: 'start_run', arguments: { workflow: 'quick-task', task: 'x', projectId: 'repob' } });
+    expect(named.isError, textOf(named)).toBeFalsy();
+    expect(calls.map((c) => c.url.pathname)).toEqual(['/api/v1/p/repob/runs']);
   });
 
   it.each([

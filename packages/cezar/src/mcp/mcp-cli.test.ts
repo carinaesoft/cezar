@@ -51,7 +51,7 @@ const REGISTRY: Project[] = [
 describe('cockpit discovery', () => {
   it('probes 4321–4370 and takes the only cockpit, whatever it serves', async () => {
     const probed: string[] = [];
-    expect(await discoverCockpit(cockpits([{ id: 'a', root: '/work/a' }], { 4330: 'a' }, probed), '/elsewhere')).toEqual({ url: 'http://127.0.0.1:4330' });
+    expect(await discoverCockpit(cockpits([{ id: 'a', root: '/work/a' }], { 4330: 'a' }, probed), '/elsewhere')).toEqual({ url: 'http://127.0.0.1:4330', bootProject: 'a' });
     expect(probed).toContain('http://127.0.0.1:4321/api/v1/health');
     expect(probed).toContain('http://127.0.0.1:4370/api/v1/health');
     expect(probed).not.toContain('http://127.0.0.1:4371/api/v1/health');
@@ -60,9 +60,9 @@ describe('cockpit discovery', () => {
   it('with several cockpits on one shared registry, takes the one booted deepest around the cwd', async () => {
     // Every cockpit "has" every project; only the boot project tells them apart.
     const fetchImpl = cockpits(REGISTRY, { 4321: 'other', 4322: 'mono', 4323: 'pkg' });
-    expect(await discoverCockpit(fetchImpl, '/work/mono/packages/pkg/src')).toEqual({ url: 'http://127.0.0.1:4323', projectId: 'pkg' });
-    expect(await discoverCockpit(fetchImpl, '/work/mono/docs')).toEqual({ url: 'http://127.0.0.1:4322', projectId: 'mono' });
-    expect(await discoverCockpit(fetchImpl, '/work/other')).toEqual({ url: 'http://127.0.0.1:4321', projectId: 'other' });
+    expect(await discoverCockpit(fetchImpl, '/work/mono/packages/pkg/src')).toEqual({ url: 'http://127.0.0.1:4323', projectId: 'pkg', bootProject: 'pkg' });
+    expect(await discoverCockpit(fetchImpl, '/work/mono/docs')).toEqual({ url: 'http://127.0.0.1:4322', projectId: 'mono', bootProject: 'mono' });
+    expect(await discoverCockpit(fetchImpl, '/work/other')).toEqual({ url: 'http://127.0.0.1:4321', projectId: 'other', bootProject: 'other' });
     // a sibling whose name merely starts the same is not inside the root
     await expect(discoverCockpit(fetchImpl, '/work/monorepo')).rejects.toThrow(/several cezar cockpits.*none was started in \/work\/monorepo.*--url/);
   });
@@ -84,7 +84,7 @@ describe('cockpit discovery', () => {
       4321: { boot: 'x', registry: [{ id: 'x', root: '/work/x' }] },
       4322: { boot: 'y', registry: [{ id: 'y', root: '/work/y' }, { id: 'z', root: '/work/z' }] },
     });
-    expect(await discoverCockpit(fetchImpl, '/work/z/src')).toEqual({ url: 'http://127.0.0.1:4322', projectId: 'z' });
+    expect(await discoverCockpit(fetchImpl, '/work/z/src')).toEqual({ url: 'http://127.0.0.1:4322', projectId: 'z', bootProject: 'y' });
   });
 
   it('a cockpit booted in an unregistered root is matched by its /health repoRoot', async () => {
@@ -94,7 +94,7 @@ describe('cockpit discovery', () => {
       if (url.pathname === '/api/v1/health') return health(url.port === '4322' ? '/work/wt' : '/work/other');
       return json({ bootProject: url.port === '4322' ? 'wt' : 'other', projectsDir: '/', projects: [{ id: 'other', root: '/work/other' }] });
     };
-    expect(await discoverCockpit(fetchImpl, '/work/wt/src')).toEqual({ url: 'http://127.0.0.1:4322' });
+    expect(await discoverCockpit(fetchImpl, '/work/wt/src')).toEqual({ url: 'http://127.0.0.1:4322', bootProject: 'wt' });
   });
 
   it('ignores a port that answers but is not a cockpit', async () => {
@@ -106,6 +106,41 @@ describe('cockpit discovery', () => {
     };
     expect(await discoverCockpit(fetchImpl, '/')).toEqual({ url: 'http://127.0.0.1:4325' });
   });
+
+  it('a port that is slow on the first probe gets a second, longer one — and nothing waits when all answer', async () => {
+    const base = cockpits(REGISTRY, { 4321: 'other', 4345: 'mono' });
+    let healthProbes = 0;
+    const slow: CezarFetchLike = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.port === '4345' && url.pathname === '/api/v1/health' && (healthProbes += 1) === 1) {
+        // misses the first deadline, answers well inside the second
+        await new Promise((r) => setTimeout(r, 1_200));
+        if (init?.signal?.aborted) throw init.signal.reason;
+      }
+      return base(input);
+    };
+    const result = await discoverCockpit(slow, '/work/mono');
+    expect(result).toEqual({ url: 'http://127.0.0.1:4345', projectId: 'mono', bootProject: 'mono' });
+    expect(healthProbes).toBe(2);
+    const started = Date.now();
+    await discoverCockpit(base, '/work/mono');
+    expect(Date.now() - started).toBeLessThan(500);
+  }, 15_000);
+
+  it('a port that stalls on both probes is named, and the choice is marked incomplete', async () => {
+    const base = cockpits(REGISTRY, { 4321: 'other', 4345: 'mono' });
+    const stall: CezarFetchLike = (input, init) =>
+      new URL(String(input)).port === '4345'
+        ? new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal?.reason)))
+        : base(input);
+    const result = await discoverCockpit(stall, '/work/mono');
+    expect(result.url).toBe('http://127.0.0.1:4321');
+    expect(result.incomplete).toEqual([expect.stringMatching(/^127\.0\.0\.1:4345 accepted a connection but did not answer/)]);
+    // nothing else answering: the error names the stalled port instead of "no cockpit"
+    const onlyStalled: CezarFetchLike = (input, init) =>
+      new URL(String(input)).port === '4345' ? stall(input, init) : Promise.reject(new TypeError('fetch failed'));
+    await expect(discoverCockpit(onlyStalled, '/work/mono')).rejects.toThrow(/no cezar cockpit answered.*127\.0\.0\.1:4345 accepted a connection/);
+  }, 15_000);
 
   it('with nothing listening, says how to fix it', async () => {
     await expect(discoverCockpit(cockpits([], {}), '/')).rejects.toThrow(/no cezar cockpit found on 127\.0\.0\.1:4321-4370.*--url/);
@@ -153,10 +188,58 @@ describe('cockpit resolver', () => {
     const resolve = createCockpitResolver({ fetch: fetchImpl, cwd: '/work/mono/packages/pkg', explicitUrl: 'http://127.0.0.1:4999' });
     expect((await resolve()).defaultProjectId).toBe('pkg');
     expect(probed).toEqual(['http://127.0.0.1:4999/api/v1/projects']);
-    // no project holds the cwd: the boot project
+    // no project holds the cwd: the boot project, by its id
     const outside = createCockpitResolver({ fetch: fetchImpl, cwd: '/tmp/elsewhere', explicitUrl: 'http://127.0.0.1:4999' });
-    expect((await outside()).defaultProjectId).toBe('default');
+    expect(await outside()).toMatchObject({ defaultProjectId: 'other' });
+    expect((await outside()).projectUnknown).toBeUndefined();
   });
+
+  it('an unreadable registry is not kept, and leaves the project unknown instead of guessing the boot project', async () => {
+    // re-QA of #1109: a 503 on the first /projects pinned the session to the boot project.
+    let projectsCalls = 0;
+    const warnings: string[] = [];
+    const base = cockpits(REGISTRY, { 4999: 'other' });
+    const resolve = createCockpitResolver({
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/api/v1/projects') && (projectsCalls += 1) === 1) return json({ error: 'busy' }, 503);
+        return base(input);
+      },
+      cwd: '/work/mono',
+      explicitUrl: 'http://127.0.0.1:4999',
+      warn: (line) => warnings.push(line),
+    });
+    const first = await resolve();
+    expect(first.defaultProjectId).toBe('default');
+    expect(first.projectUnknown).toMatch(/could not read the project list of http:\/\/127\.0\.0\.1:4999 \(503\).*pass projectId/);
+    expect(warnings).toEqual([expect.stringMatching(/4999 did not list its projects \(503\).*this call only/)]);
+    const second = await resolve();
+    expect(second).not.toBe(first);
+    expect(second.defaultProjectId).toBe('mono');
+    expect(second.projectUnknown).toBeUndefined();
+    expect(await resolve()).toBe(second);
+  });
+
+  it('a discovery that had to skip a stalled port is not kept, and says which port', async () => {
+    let stalled = true;
+    const warnings: string[] = [];
+    const base = cockpits(REGISTRY, { 4321: 'other', 4345: 'mono' });
+    const resolve = createCockpitResolver({
+      fetch: (input, init) =>
+        stalled && new URL(String(input)).port === '4345'
+          ? new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal?.reason)))
+          : base(input),
+      cwd: '/work/mono',
+      warn: (line) => warnings.push(line),
+    });
+    const first = await resolve();
+    expect(first.defaultProjectId).toBe('mono');
+    expect(warnings).toEqual([expect.stringMatching(/127\.0\.0\.1:4345 accepted a connection but did not answer .*this call only/)]);
+    stalled = false;
+    const second = await resolve();
+    expect(second).not.toBe(first);
+    expect(await resolve()).toBe(second);
+    expect(warnings).toHaveLength(1);
+  }, 15_000);
 
   it('--project wins over the cwd, without asking the registry', async () => {
     const probed: string[] = [];

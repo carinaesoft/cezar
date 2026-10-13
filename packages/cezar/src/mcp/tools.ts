@@ -44,6 +44,9 @@ import { CezarApiError, isConnectionError, longDeadline, readJson, type CezarCli
 export interface Cockpit {
   api: CezarClient;
   defaultProjectId: string;
+  /** Set when the project holding the cwd could not be determined: why. Reads still use
+   *  `defaultProjectId`; `start_run` without a `projectId` refuses with this instead of guessing. */
+  projectUnknown?: string;
 }
 
 export interface McpToolsOptions {
@@ -136,13 +139,17 @@ const runStatusOutput = apiRunSchema
     prNumber: true,
     costUsd: true,
   })
-  .extend({ status: z.string(), activity: z.string().optional() });
+  .extend({
+    projectId: z.string().describe('The project the run belongs to — pass it as projectId to address the run.'),
+    status: z.string(),
+    activity: z.string().optional(),
+  });
 type RunStatusOutput = z.infer<typeof runStatusOutput>;
 
 /** The whole record, long strings clipped; loose because the record grows with every release. */
 const runOutput = apiRunSchema
   .pick({ id: true, title: true, workflow: true, task: true, createdAt: true })
-  .extend({ status: z.string() })
+  .extend({ projectId: z.string(), status: z.string() })
   .loose();
 
 const eventsOutput = runHistoryPageSchema.pick({ asOfSeq: true, olderCursor: true, newerCursor: true }).extend({
@@ -365,18 +372,23 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       }),
   );
 
-  /** The project a run lives in, from the cross-project index (`undefined` when the index — capped
-   *  per project — does not list it). */
-  const findRunProject = async (c: Cockpit, runId: string) =>
-    (await readJson(await c.api.api.v1.workspace['runs-index'].$get())).runs.find((r) => r.id === runId)?.projectId;
+  /** The project a run lives in, from the cross-project index, and the projects whose older runs
+   *  the index — capped per project — leaves out. */
+  const findRunProject = async (c: Cockpit, runId: string) => {
+    const index = await readJson(await c.api.api.v1.workspace['runs-index'].$get());
+    return { found: index.runs.find((r) => r.id === runId)?.projectId, capped: index.truncated };
+  };
   const isNotFound = (error: unknown) => error instanceof CezarApiError && error.status === 404;
-  const notFoundHint = (runId: string, error: CezarApiError, found?: string) =>
-    new CezarApiError(
-      404,
-      found
-        ? `${error.message} — run ${runId} belongs to project "${found}"; pass projectId: "${found}"`
-        : `${error.message} — run ${runId} is not in the default project; pass its projectId (list_runs shows it)`,
-    );
+  const notFoundHint = (runId: string, error: CezarApiError, lookup?: { found?: string; capped: string[] }) => {
+    const hint = !lookup
+      ? `run ${runId} is not in the default project; pass its projectId (list_runs shows it)`
+      : lookup.found
+        ? `run ${runId} belongs to project "${lookup.found}"; pass projectId: "${lookup.found}"`
+        : lookup.capped.length
+          ? `run ${runId} is in no project's recent runs (older runs of ${lookup.capped.join(', ')} are not indexed) — check the id, or pass its projectId`
+          : `no project of this cockpit has a run ${runId} — check the id (list_runs)`;
+    return new CezarApiError(404, `${error.message} — ${hint}`);
+  };
   /**
    * Run `fn` against the run's project. Named: that one. Not named: the default project, and on a
    * 404 the project the cross-project index places the run in — a run id is global, so a read may
@@ -394,17 +406,19 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       return await fn(c.defaultProjectId);
     } catch (error) {
       if (!isNotFound(error)) throw error;
-      const found = await findRunProject(c, runId).catch(() => undefined);
+      const lookup = await findRunProject(c, runId).catch(() => undefined);
+      const found = lookup?.found;
       if (follow && found && found !== c.defaultProjectId) return fn(found);
-      throw notFoundHint(runId, error as CezarApiError, found);
+      throw notFoundHint(runId, error as CezarApiError, lookup);
     }
   };
   const readRun = async (c: Cockpit, projectId: string, runId: string, signal?: AbortSignal) =>
     readJson(await c.api.api.v1.p[':projectId'].runs[':id'].$get({ param: { projectId, id: runId } }, signal ? { init: { signal } } : undefined));
+  /** The run record, with the project it was read from. */
   const getRun = (c: Cockpit, projectId: string | undefined, runId: string) =>
-    inRunProject(c, projectId, runId, (pid) => readRun(c, pid, runId));
-  const statusOf = (run: unknown): RunStatusOutput => {
-    const status = runStatusOutput.parse(run);
+    inRunProject(c, projectId, runId, async (pid) => ({ ...(await readRun(c, pid, runId)), projectId: pid }));
+  const statusOf = (run: object, projectId: string): RunStatusOutput => {
+    const status = runStatusOutput.parse({ ...run, projectId });
     return { ...clip(status, 300), ...(status.error === undefined ? {} : { error: clip(status.error, 500) }) };
   };
 
@@ -429,7 +443,11 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       outputSchema: runStatusOutput,
       annotations: READ,
     },
-    ({ projectId, runId }) => read(async (c) => statusOf(await getRun(c, projectId, runId))),
+    ({ projectId, runId }) =>
+      read(async (c) => {
+        const run = await getRun(c, projectId, runId);
+        return statusOf(run, run.projectId);
+      }),
   );
 
   server.registerTool(
@@ -549,14 +567,12 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
           timeoutMs: (timeoutSeconds ?? WAIT_DEFAULT_SECONDS) * 1000,
           pollMs,
           // A followed run's project is looked up once, not on every poll.
-          fetchRun: async (id, signal) =>
-            statusOf(
-              await inRunProject(c, projectId ?? found.get(id), id, async (pid) => {
-                const run = await readRun(c, pid, id, signal);
-                found.set(id, pid);
-                return run;
-              }),
-            ),
+          fetchRun: (id, signal) =>
+            inRunProject(c, projectId ?? found.get(id), id, async (pid) => {
+              const run = await readRun(c, pid, id, signal);
+              found.set(id, pid);
+              return statusOf(run, pid);
+            }),
         }),
         { retry: false },
       );
@@ -603,9 +619,11 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     ({ projectId, ...body }) =>
-      write(async (c) =>
-        statusOf(await readJson(await c.api.api.v1.p[':projectId'].runs.$post({ param: { projectId: projectOf(c, projectId) }, json: body }))),
-      ),
+      write(async (c) => {
+        if (!projectId && c.projectUnknown) throw new Error(c.projectUnknown);
+        const pid = projectOf(c, projectId);
+        return statusOf(await readJson(await c.api.api.v1.p[':projectId'].runs.$post({ param: { projectId: pid }, json: body })), pid);
+      }),
   );
 
   server.registerTool(
