@@ -626,16 +626,24 @@ registry, so with several the one *started* in the agent's working directory
 there, or two were started in the same place, the tools say so and ask for
 `--url` rather than guess. The handshake never needs a cockpit — a missing one is
 a readable tool error — and a cockpit restarted on another port is found again
-on the next call. Inside a cezar task an absent `CEZ_API_URL` still means the
+on the next call. A port that accepts the connection but misses the 800 ms probe
+is asked once more with 3 s; if it still says nothing, the choice is made without
+it, `cez mcp` names that port on stderr, and the answer is used for that call only
+— the next call looks again. Inside a cezar task an absent `CEZ_API_URL` still means the
 cockpit withheld it, so `cez mcp` does not probe there.
 
 **Which project.** However the cockpit was found — `--url` and `CEZ_API_URL`
 included — tools that name no `projectId` target `--project` (else
 `CEZ_PROJECT_ID`), else the project in that cockpit's registry holding the
-working directory, else the cockpit's boot project (`default`). A run id is
-global: a read tool (`get_run`, `get_run_status`, `list_run_events`,
+working directory, else the cockpit's boot project. When the registry cannot be
+read (an error status, a timeout), nothing is remembered: reads fall back to the
+boot project for that call, `start_run` without a `projectId` refuses with the
+reason instead of guessing, and the next call reads the registry again. A run id
+is global: a read tool (`get_run`, `get_run_status`, `list_run_events`,
 `wait_for_runs`) given no `projectId` follows a run that lives in another
-project; `cancel_run` does not guess and names the project to pass instead.
+project; `cancel_run` does not guess and names the project to pass instead. A
+run no project has is reported as such. `start_run`, `get_run`,
+`get_run_status` and `wait_for_runs` answer with the run's `projectId`.
 
 **Flags.** `--project <id>` sets the project tools target when a call names
 none (else `CEZ_PROJECT_ID`, else the project holding the working directory,
@@ -670,7 +678,7 @@ or after `timeoutSeconds` (default 40, max 45) with `timedOut: true` — then ju
 call it again with the same ids:
 
 ```text
-start_run { workflow: "quick-task", task: "…" }        → { id: "4f1c…", status: "queued" }
+start_run { workflow: "quick-task", task: "…" }        → { id: "4f1c…", projectId: "repob", status: "queued" }
 wait_for_runs { runIds: ["4f1c…"] }                    → { runs: [{ status: "running" }], timedOut: true }
 wait_for_runs { runIds: ["4f1c…"] }                    → { runs: [{ status: "review" }], timedOut: false }
 list_run_events { runId: "4f1c…", afterSeq: 0 }        → what the agent did
