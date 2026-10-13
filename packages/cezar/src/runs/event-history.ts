@@ -348,10 +348,72 @@ async function readFileTail(filePath: string): Promise<{ fileSize: number; fileH
   }
 }
 
+/**
+ * A line-start offset before which every line has `seq <= afterSeq`, found by bisecting the file:
+ * `appendEvent` writes seqs in increasing order, so `?afterSeq=` near the tip of a long transcript
+ * reads a few chunks instead of the whole prefix. An unreadable line only ever lowers the upper
+ * bound, so the answer errs toward reading more, never toward skipping an event.
+ */
+async function seekAfterSeq(filePath: string, afterSeq: number): Promise<{ offset: number; bytesRead: number }> {
+  let size = 0;
+  try {
+    size = (await stat(filePath)).size;
+  } catch {
+    return { offset: 0, bytesRead: 0 };
+  }
+  if (size <= READ_CHUNK_BYTES) return { offset: 0, bytesRead: 0 };
+  const handle = await open(filePath, 'r');
+  let bytesRead = 0;
+  /** The first line starting after the newline at or past `from`, and its seq when it parses. */
+  const lineAfter = async (from: number): Promise<{ start: number; seq?: number } | undefined> => {
+    let start = -1;
+    let position = from;
+    const parts: Buffer[] = [];
+    while (position < size) {
+      const length = Math.min(READ_CHUNK_BYTES, size - position);
+      const buffer = Buffer.allocUnsafe(length);
+      const read = (await handle.read(buffer, 0, length, position)).bytesRead;
+      if (read === 0) break;
+      bytesRead += read;
+      let chunk = buffer.subarray(0, read);
+      position += read;
+      if (start < 0) {
+        const newline = chunk.indexOf(0x0a);
+        if (newline < 0) continue;
+        start = position - read + newline + 1;
+        chunk = chunk.subarray(newline + 1);
+      }
+      const end = chunk.indexOf(0x0a);
+      if (end >= 0) {
+        parts.push(chunk.subarray(0, end));
+        break;
+      }
+      parts.push(Buffer.from(chunk));
+    }
+    if (start < 0 || start >= size) return undefined;
+    const seq = parseLine(Buffer.concat(parts).toString('utf8'))?.seq;
+    return seq === undefined ? { start } : { start, seq };
+  };
+  let lo = 0;
+  let hi = size;
+  try {
+    while (hi - lo > READ_CHUNK_BYTES) {
+      const mid = lo + Math.floor((hi - lo) / 2);
+      const line = await lineAfter(mid);
+      if (line && line.start < hi && line.seq !== undefined && line.seq <= afterSeq) lo = line.start;
+      else hi = mid;
+    }
+  } finally {
+    await handle.close();
+  }
+  return { offset: lo, bytesRead };
+}
+
 async function forwardEventsUntil(
   filePath: string,
   afterSeq: number,
   wantedItems: number,
+  start = 0,
 ): Promise<{ events: RunHistoryEvent[]; reachedEnd: boolean; bytesRead: number; canonical?: CanonicalItem[] }> {
   const events: RunHistoryEvent[] = [];
   let canonical: CanonicalItem[] | undefined;
@@ -359,7 +421,7 @@ async function forwardEventsUntil(
   let reachedEnd = true;
   let input: ReturnType<typeof createReadStream> | undefined;
   try {
-    input = createReadStream(filePath, { encoding: 'utf8' });
+    input = createReadStream(filePath, { encoding: 'utf8', start });
     const lines = createInterface({ input, crlfDelay: Infinity });
     for await (const line of lines) {
       const event = parseLine(line);
@@ -419,6 +481,7 @@ export async function readRunHistoryPage(
   filePath: string,
   cursor?: string,
   onRead?: (instrumentation: HistoryReadInstrumentation) => void,
+  afterSeq?: number,
 ): Promise<RunHistoryPage> {
   const decoded = cursor === undefined ? undefined : decodePageCursor(cursor);
   const currentSize = await stat(filePath).then(({ size }) => size).catch(() => 0);
@@ -426,8 +489,11 @@ export async function readRunHistoryPage(
     throw new HistoryCursorError(409, 'history cursor is no longer valid — reload the newest page');
   }
   const highWaterRead = await readFileTail(filePath);
-  const forward = decoded?.direction === 'newer'
-    ? await forwardEventsUntil(filePath, decoded.boundarySeq, RUN_HISTORY_PAGE_ITEMS)
+  // `afterSeq` takes the forward branch from a seq instead of a cursor's boundary (#1109).
+  const forwardFrom = afterSeq ?? (decoded?.direction === 'newer' ? decoded.boundarySeq : undefined);
+  const seek = afterSeq === undefined ? undefined : await seekAfterSeq(filePath, afterSeq);
+  const forward = forwardFrom !== undefined
+    ? await forwardEventsUntil(filePath, forwardFrom, RUN_HISTORY_PAGE_ITEMS, seek?.offset)
     : undefined;
   const reverse = forward === undefined
     ? await reverseEventsUntil(
@@ -437,25 +503,30 @@ export async function readRunHistoryPage(
       )
     : undefined;
   const scannedEvents = forward?.events ?? reverse?.events ?? [];
-  const canonical = forward?.canonical ?? reverse?.canonical ?? canonicalSessionItems(scannedEvents);
+  const scannedItems = forward?.canonical ?? reverse?.canonical ?? canonicalSessionItems(scannedEvents);
+  // A turn opener at or below `afterSeq` frames the page's first turn; it is not part of the answer.
+  const canonical = afterSeq === undefined ? scannedItems : scannedItems.filter((item) => item.lastSeq > afterSeq);
   const selected = forward
     ? canonical.slice(0, RUN_HISTORY_PAGE_ITEMS)
     : canonical.slice(-RUN_HISTORY_PAGE_ITEMS);
   const hasOlder = forward
-    ? decoded!.boundarySeq > 0
+    ? forwardFrom! > 0
     : canonical.length > selected.length || !(reverse?.reachedStart ?? true);
   const hasNewer = forward
     ? canonical.length > selected.length || !forward.reachedEnd
     : decoded !== undefined && selected.length > 0;
-  const events = forward
-    ? forwardPageEventSlice(scannedEvents, selected)
-    : pageEventSlice(scannedEvents, selected);
+  const events = afterSeq !== undefined
+    // The last page runs to the end of the file, so events after the last item are not lost.
+    ? (hasNewer ? forwardPageEventSlice(scannedEvents, selected) : scannedEvents).filter((event) => event.seq > afterSeq)
+    : forward
+      ? forwardPageEventSlice(scannedEvents, selected)
+      : pageEventSlice(scannedEvents, selected);
   const asOfSeq = highWaterRead.fileHighWater;
   const oldest = selected[0];
   const newest = selected.at(-1);
   onRead?.({
     fileSize: highWaterRead.fileSize,
-    bytesRead: (reverse?.bytesRead ?? forward?.bytesRead ?? 0) + highWaterRead.bytesRead,
+    bytesRead: (reverse?.bytesRead ?? forward?.bytesRead ?? 0) + highWaterRead.bytesRead + (seek?.bytesRead ?? 0),
     retainedEvents: scannedEvents.length,
   });
   return {
@@ -486,6 +557,7 @@ export async function readRunHistoryPage(
     liveCursor: encodeCursor({ v: 1, kind: 'live', offset: highWaterRead.fileSize, boundarySeq: asOfSeq }),
     asOfSeq,
     hasOlder,
+    ...(afterSeq === undefined ? {} : { afterSeq }),
   };
 }
 

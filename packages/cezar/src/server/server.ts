@@ -4432,9 +4432,8 @@ export function createApp(deps: ServerDeps) {
         const { id } = c.req.valid('param');
         if (!store.getRun(id)) return c.json({ error: 'not found' }, 404);
         try {
-          return c.json(
-            await readRunHistoryPage(join(dataDir, 'runs', `${id}.ndjson`), c.req.valid('query').cursor),
-          );
+          const { cursor, afterSeq } = c.req.valid('query');
+          return c.json(await readRunHistoryPage(join(dataDir, 'runs', `${id}.ndjson`), cursor, undefined, afterSeq));
         } catch (error) {
           if (error instanceof HistoryCursorError) return c.json({ error: error.message }, error.status);
           throw error;
