@@ -695,11 +695,19 @@ at that time by itself, so wait again after it.
 **Answer size.** Every answer stays under 40 000 characters, so it fits a
 client's tool-result limit. `list_run_events` returns at most `maxEvents`
 (default 200, max 500) events, each text field clipped to `maxChars` (default
-1000), and stops at the budget with `truncated: true`. Nothing is lost: with
+1000), and stops at the budget — or at the end of the cockpit's page — with
+`truncated: true`. Nothing is lost: with
 `afterSeq` or a `cursor`, continue with `afterSeq: nextAfterSeq` (and the same
 `cursor`); without either — the newest events — read the older part it left out
 with `afterSeq: skippedAfterSeq`. `list_runs` counts rows past the budget in
 `more`, like rows past `limit`.
+
+**Catching up with `afterSeq`.** On a cockpit whose `/history` takes `afterSeq`
+(the release after 0.15.0), `list_run_events` with `afterSeq` is one request
+that reads forward from that seq. An older cockpit ignores the parameter or
+refuses it; `cez mcp` tells by whether the answer echoes `afterSeq`, and then
+walks back from the newest page instead — at most five pages, past which the
+answer says `gap: true` and gives `olderCursor` for the part it did not read.
 
 ### The HTTP API
 
@@ -717,6 +725,16 @@ with `afterSeq: skippedAfterSeq`. `list_runs` counts rows past the budget in
   response is a zod schema in [`packages/contract`](../packages/contract/src).
   The common ones: `GET/POST /runs`, `GET /runs/:id`,
   `POST /runs/:id/{cancel,messages,continue,archive}`, `GET /automations`.
+- **Reading a transcript.** `GET /runs/:id/history` answers one page of
+  100 transcript items, the newest by default, with `olderCursor` /
+  `newerCursor` to page (cursors are short-lived) and `asOfSeq`, the newest seq
+  in the file. `?afterSeq=<n>` reads forward instead: the events with a seq
+  greater than `n`, oldest first, one page at a time, and echoes `afterSeq` in
+  the answer. While `newerCursor` is present there is more — continue with
+  `afterSeq` set to the last seq returned (or with that cursor). It cannot be
+  combined with `cursor`, and a negative or non-integer value is a `400`. A
+  cockpit older than the parameter ignores it and answers the newest page,
+  without the echo.
 - **No built-in auth.** The cockpit binds `127.0.0.1` and trusts the machine;
   see [Remote access](#remote-access-host-cezar-on-a-server) before exposing it.
 

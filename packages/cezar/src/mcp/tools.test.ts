@@ -383,7 +383,7 @@ describe('cez mcp tools: list_run_events', () => {
     expect(body.asOfSeq).toBe(1_000);
   });
 
-  it('afterSeq walks back from the tip until it is covered, and returns only newer events', async () => {
+  it('afterSeq on a cockpit that ignores it walks back from the tip until covered, and returns only newer events', async () => {
     const calls: Call[] = [];
     const pages: Record<string, ReturnType<typeof page>> = { tip: page(901, 1_000, 'c1'), c1: page(800, 901, 'c2'), c2: page(700, 800, 'c3') };
     const mcp = await connect(
@@ -395,7 +395,93 @@ describe('cez mcp tools: list_run_events', () => {
     expect(body.events.map((e) => e.seq)).toEqual(Array.from({ length: 150 }, (_, i) => 851 + i));
     expect(body.gap).toBeUndefined();
     expect(body.olderCursor).toBeUndefined();
-    expect(calls).toHaveLength(2);
+    // An older cockpit (0.12.0) ignores afterSeq and answers the newest page — no echo, so the
+    // walk starts from that answer instead of asking again.
+    expect(calls.map((c) => c.url.search)).toEqual(['?afterSeq=850', '?cursor=c1']);
+  });
+
+  describe('afterSeq on a cockpit that knows it', () => {
+    /** A cockpit with `afterSeq` on `/history`: it reads forward and echoes the parameter. */
+    const forwardCockpit = (tip: number, perPage = 100) => (url: URL): Reply => {
+      const raw = url.searchParams.get('afterSeq');
+      if (raw === null) return { body: page(tip - 99, tip, 'c1') };
+      const after = Number(raw);
+      const to = Math.min(tip, after + perPage);
+      return {
+        body: {
+          ...page(after + 1, to),
+          asOfSeq: tip,
+          afterSeq: after,
+          hasOlder: after > 0,
+          ...(to < tip ? { newerCursor: `n${to}` } : {}),
+        },
+      };
+    };
+
+    it('reads with one request, however far back afterSeq is', async () => {
+      const calls: Call[] = [];
+      const mcp = await connect({ 'GET /api/v1/p/default/runs/r1/history': forwardCockpit(10_000) }, { calls });
+      const result = await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', afterSeq: 5 } });
+      const body = result.structuredContent as { events: Array<{ seq: number }>; gap?: boolean; olderCursor?: string; truncated?: boolean; nextAfterSeq?: number };
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.url.searchParams.get('afterSeq')).toBe('5');
+      expect(calls[0]!.url.searchParams.has('cursor')).toBe(false);
+      expect(body.events.map((e) => e.seq)).toEqual(Array.from({ length: 100 }, (_, i) => 6 + i));
+      expect(body.gap).toBeUndefined();
+      expect(body.olderCursor).toBeUndefined();
+      // the cockpit had more: continue from the last seq returned
+      expect(body.truncated).toBe(true);
+      expect(body.nextAfterSeq).toBe(105);
+    });
+
+    it('at the tip: what is new, and no continuation', async () => {
+      const calls: Call[] = [];
+      const mcp = await connect({ 'GET /api/v1/p/default/runs/r1/history': forwardCockpit(1_000) }, { calls });
+      const body = (await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', afterSeq: 990 } })).structuredContent as {
+        events: Array<{ seq: number }>;
+        truncated?: boolean;
+        nextAfterSeq?: number;
+        asOfSeq: number;
+      };
+      expect(calls).toHaveLength(1);
+      expect(body.events.map((e) => e.seq)).toEqual(Array.from({ length: 10 }, (_, i) => 991 + i));
+      expect(body.truncated).toBeUndefined();
+      expect(body.nextAfterSeq).toBeUndefined();
+      expect(body.asOfSeq).toBe(1_000);
+      const none = (await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', afterSeq: 1_000 } })).structuredContent as { events: unknown[] };
+      expect(none.events).toEqual([]);
+    });
+
+    it('nextAfterSeq walks the whole run once, each answer inside the budget', async () => {
+      const mcp = await connect({ 'GET /api/v1/p/default/runs/r1/history': forwardCockpit(450) });
+      const seen: number[] = [];
+      let afterSeq: number | undefined = 0;
+      for (let i = 0; i < 20 && afterSeq !== undefined; i += 1) {
+        const result = await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', afterSeq, maxEvents: 70 } });
+        expect(textOf(result).length).toBeLessThanOrEqual(RESPONSE_BUDGET_CHARS);
+        const body = result.structuredContent as { events: Array<{ seq: number }>; nextAfterSeq?: number };
+        seen.push(...body.events.map((e) => e.seq));
+        afterSeq = body.nextAfterSeq;
+      }
+      expect(seen).toEqual(Array.from({ length: 450 }, (_, i) => 1 + i));
+    });
+  });
+
+  it('a cockpit that refuses afterSeq (400) is asked for the newest page and walked back', async () => {
+    const calls: Call[] = [];
+    const pages: Record<string, ReturnType<typeof page>> = { tip: page(901, 1_000, 'c1'), c1: page(800, 901, 'c2') };
+    const mcp = await connect(
+      {
+        'GET /api/v1/p/default/runs/r1/history': (url) =>
+          url.searchParams.has('afterSeq') ? { status: 400, body: { error: 'unknown query parameter' } } : { body: pages[url.searchParams.get('cursor') ?? 'tip'] },
+      },
+      { calls },
+    );
+    const result = await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', afterSeq: 850 } });
+    expect(result.isError).toBeFalsy();
+    const body = result.structuredContent as { events: Array<{ seq: number }>; gap?: boolean };
+    expect(body.events.map((e) => e.seq)).toEqual(Array.from({ length: 150 }, (_, i) => 851 + i));
+    expect(calls.map((c) => c.url.search)).toEqual(['?afterSeq=850', '', '?cursor=c1']);
   });
 
   it('afterSeq too far back stops after a bounded walk and says there is a gap', async () => {

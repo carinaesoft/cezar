@@ -70,7 +70,8 @@ export const WAIT_DEFAULT_SECONDS = 40;
 export const WAIT_POLL_MS = 2_000;
 /** `GET /models` may ask a vendor CLI first, bounded at 15 s server-side — past the 10 s default. */
 const MODELS_TIMEOUT_MS = 30_000;
-/** Without `afterSeq` on `/history`, catching up walks back at most this many pages (100 items each). */
+/** Against a cockpit without `afterSeq` on `/history`, catching up walks back at most this many
+ *  pages (100 items each). */
 export const EVENTS_MAX_WALK_PAGES = 5;
 /** One tool answer, serialized. It travels twice (text + structuredContent) and Claude Code refuses
  *  results past ~25k tokens; a long run's history page alone was ~344k chars. */
@@ -487,18 +488,29 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       read((c) =>
         inRunProject(c, projectId, runId, async (pid) => {
           const param = { projectId: pid, id: runId };
-          const page = async (at?: string) =>
-            readJson(await c.api.api.v1.p[':projectId'].runs[':id'].history.$get({ param, query: at ? { cursor: at } : {} }));
-          const first = await page(cursor);
+          const history = async (query: { cursor?: string; afterSeq?: string }) =>
+            readJson(await c.api.api.v1.p[':projectId'].runs[':id'].history.$get({ param, query }));
+          const page = (at?: string) => history(at ? { cursor: at } : {});
+          const forward = afterSeq !== undefined && cursor === undefined;
+          // One request reads forward from `afterSeq` where the cockpit knows the parameter — it
+          // echoes it back. An older cockpit ignores it and answers the newest page, which the walk
+          // below starts from; one that refuses it (400) is asked for the newest page instead.
+          const first = forward
+            ? await history({ afterSeq: String(afterSeq) }).catch((error: unknown) => {
+                if (error instanceof CezarApiError && error.status === 400) return page();
+                throw error;
+              })
+            : await page(cursor);
+          const honoured = forward && first.afterSeq === afterSeq;
           const bySeq = new Map(first.events.map((e) => [e.seq, e]));
           let olderCursor = first.hasOlder ? first.olderCursor : undefined;
           let coveredFrom = pageStart(first.events);
           // Every event from `coveredFrom` on has been read, so the range is reached once it is at
           // most `afterSeq + 1` (seqs are integers).
-          const covers = () => afterSeq === undefined || coveredFrom <= afterSeq + 1;
-          // `/history` has no `afterSeq` yet (a separate PR, #1109): walk back from the tip, bounded,
-          // until a page starts at or below `afterSeq`.
-          if (afterSeq !== undefined && cursor === undefined) {
+          const covers = () => honoured || afterSeq === undefined || coveredFrom <= afterSeq + 1;
+          // Without `afterSeq` on the cockpit: walk back from the tip, bounded, until a page starts
+          // at or below `afterSeq`.
+          if (forward && !honoured) {
             for (let walked = 0; olderCursor && !covers() && walked < EVENTS_MAX_WALK_PAGES; walked += 1) {
               const older = await page(olderCursor);
               for (const e of older.events) bySeq.set(e.seq, e);
@@ -528,11 +540,13 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
           });
           if (newest) kept.reverse();
           const cut = events.length - kept.length;
+          // A forward page that stops before the tip leaves newer events out, as a cut does.
+          const more = cut > 0 || (honoured && first.newerCursor !== undefined && kept.length > 0);
           return eventsOutput.parse({
             ...envelope,
             events: kept,
-            ...(cut > 0 ? { truncated: true } : {}),
-            ...(cut > 0 && !newest ? { nextAfterSeq: kept.at(-1)!.seq } : {}),
+            ...(more ? { truncated: true } : {}),
+            ...(more && !newest ? { nextAfterSeq: kept.at(-1)!.seq } : {}),
             ...(cut > 0 && newest ? { skippedAfterSeq: pageStart(events.slice(0, cut)) - 1 } : {}),
           });
         }),
