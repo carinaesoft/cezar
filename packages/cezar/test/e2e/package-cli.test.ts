@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile as execFileCallback } from 'node:child_process';
+import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -61,6 +61,33 @@ test('the release tarball installs and runs the dry-run CLI workflow', { timeout
     });
     assert.match(help.stdout, /cezar — local cockpit/);
     assert.match(help.stdout, /cezar run "<task>"/);
+
+    // `cezar mcp` from the tarball: the MCP SDK resolves from the installed dependencies, the
+    // handshake needs no cockpit (discovery is lazy), and stdout carries JSON-RPC only.
+    const mcpLines = await new Promise<string[]>((resolveLines, reject) => {
+      const child = spawn(process.execPath, [cliPath, 'mcp', '--url', 'http://127.0.0.1:9'], { cwd: consumerDir });
+      let out = '';
+      const timer = setTimeout(() => {
+        child.kill();
+        reject(new Error(`cezar mcp did not answer tools/list; stdout: ${out}`));
+      }, 30_000);
+      child.stdout.on('data', (chunk: Buffer) => {
+        out += chunk.toString('utf8');
+        if (out.includes('"id":2')) {
+          clearTimeout(timer);
+          child.stdin.end();
+          resolveLines(out.trim().split('\n'));
+        }
+      });
+      child.on('error', reject);
+      const send = (message: unknown) => child.stdin.write(`${JSON.stringify(message)}\n`);
+      send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '0' } } });
+      send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+      send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    });
+    const mcpMessages = mcpLines.map((line) => JSON.parse(line) as { id?: number; result?: { tools?: Array<{ name: string }> } });
+    const toolNames = mcpMessages.find((m) => m.id === 2)?.result?.tools?.map((t) => t.name) ?? [];
+    assert.ok(toolNames.includes('list_runs') && toolNames.includes('start_run'), `cezar mcp lists its tools: ${toolNames.join(', ')}`);
 
     const fixtureRepo = join(root, 'fixture-repo');
     await mkdir(fixtureRepo);

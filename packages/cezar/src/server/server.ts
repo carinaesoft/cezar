@@ -3,6 +3,7 @@ import {
   trackerCandidatesQuerySchema, trackerListQuerySchema, trackerSearchQuerySchema, trackerItemQuerySchema, trackerReadScope,
   trackerCredentialsSchema, trackerItemParamsSchema, trackerAssociationInputSchema, type TrackerChangedEvent,
 } from '@open-mercato/cezar-contract';
+import { mcpEnabled, mountMcp } from '../mcp/http.ts';
 import { createTrackerService } from './tracker/index.ts';
 import { TrackerWatches } from './tracker/watch.ts';
 import { readTrackerAssociation, writeTrackerAssociation, clearTrackerAssociation } from '../tracker-association.ts';
@@ -6306,6 +6307,9 @@ export function createApp(deps: ServerDeps) {
   // an unknown API path must never answer with HTML.
   // Without a web/dist build this serves the built-in build-hint page (dev-only
   // state — the published tarball ships web/dist), never a 404.
+  // SPIKE (MCP PoC): opt-in Streamable HTTP MCP endpoint. Unchained on purpose — see src/mcp/http.ts.
+  if (mcpEnabled()) mountMcp(routed, { version: deps.version });
+
   routed.get('*', (c) => serveShell(c) ?? c.notFound());
 
   return routed;

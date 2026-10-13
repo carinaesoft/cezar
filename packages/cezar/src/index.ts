@@ -52,6 +52,8 @@ Usage:
   cezar projects            list the projects this cockpit serves
                             (also: projects add [<dir>] · projects remove <id>)
   cezar tracker-connections <list|remove ID>  inspect or delete local project credentials
+  cezar mcp                 MCP server (stdio) for agents outside cezar to list, start and follow
+                            runs on a running cockpit (cezar mcp --help)
   cezar server-install      interactive wizard to host cezar on a server
   cezar server-deploy       redeploy a new version (reload the service) + verify
   cezar server-uninstall    reverse a server-install
@@ -94,6 +96,15 @@ async function main(): Promise<void> {
   // cockpit's parser can refuse them. It only talks to an already-running cockpit.
   if (process.argv[2] === 'task') {
     process.exitCode = await runTaskCommand(process.argv.slice(3));
+    return;
+  }
+  // `cez mcp`: an MCP server on stdio over a running cockpit's API. Its stdout is the JSON-RPC
+  // channel, so anything that would print there is sent to stderr first; the module (and the MCP
+  // SDK behind it) loads only for this command.
+  if (process.argv[2] === 'mcp') {
+    console.log = console.error;
+    const { runMcpCommand } = await import('./mcp/mcp-cli.ts');
+    process.exitCode = await runMcpCommand(process.argv.slice(3));
     return;
   }
   // `cez automation …` (spec 2026-09-13-automations-from-prompt): same shape, same reason.
