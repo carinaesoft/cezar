@@ -7,7 +7,7 @@ Everything the [README](../README.md) leaves out: the full configuration, every 
 - [Multiple projects, one cockpit](#multiple-projects-one-cockpit)
 - [Workflow format](#workflow-format)
 - [How it runs agents](#how-it-runs-agents) (environment variables, troubleshooting)
-- [Talking to a running cockpit](#talking-to-a-running-cockpit) (`cez runs`, `cez task`, `cez automation`, the HTTP API)
+- [Talking to a running cockpit](#talking-to-a-running-cockpit) (`cez runs`, `cez task`, `cez automation`, `cez mcp`, the HTTP API)
 - [Coding agent backends](#coding-agent-backends)
 - [Remote access (host cezar on a server)](#remote-access-host-cezar-on-a-server)
 - [Configuration](#configuration-optional)
@@ -527,8 +527,8 @@ platform.
 
 ## Talking to a running cockpit
 
-The cockpit is a local HTTP server; three CLIs and any script can talk to it
-while it runs. They find it through `CEZ_API_URL` — the address the cockpit
+The cockpit is a local HTTP server; three CLIs, MCP clients (through `cez mcp`) and any script
+can talk to it while it runs. They find it through `CEZ_API_URL` — the address the cockpit
 printed after `cockpit →` when it started (`http://127.0.0.1:4321` unless that
 port was busy or you passed `--port`).
 
@@ -553,10 +553,98 @@ project the cockpit was started in.
 says dispatch or automations are unavailable, and a fallback would let a task
 write to whatever cockpit owns the port. So a command run without it exits `2`
 and explains how to set it (inside a task, it tells the agent to stop and
-report instead).
+report instead). `cez mcp`, below, is the one client that looks for a cockpit
+by itself — and only outside a task.
 
 `cez runs` is read-only. Cancel, relaunch and archive from the cockpit, or call
 the API below.
+
+### From another agent: `cez mcp`
+
+`cez mcp` is an [MCP](https://modelcontextprotocol.io) server on stdio for
+agents that run *outside* cezar — Claude Code, Codex, OpenCode or your own
+orchestrator — so they can hand work to a running cockpit and follow it. (An
+agent *inside* a cezar task uses `cez task` instead.) It is a thin client of
+the API below: start the cockpit as usual, then add one entry to the agent's
+MCP config. Nothing to configure in cezar.
+
+**Claude Code** — `claude mcp add cezar -- npx -y cezar-run mcp`, or in `.mcp.json`:
+
+```json
+{ "mcpServers": { "cezar": { "command": "npx", "args": ["-y", "cezar-run", "mcp"] } } }
+```
+
+**Codex** — `~/.codex/config.toml`. `wait_for_runs` holds a call for up to 45 s,
+so keep `tool_timeout_sec` above that (60 is Codex's default; say it out loud):
+
+```toml
+[mcp_servers.cezar]
+command = "npx"
+args = ["-y", "cezar-run", "mcp"]
+tool_timeout_sec = 60
+```
+
+**OpenCode** — `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": { "cezar": { "type": "local", "command": ["npx", "-y", "cezar-run", "mcp"], "enabled": true } }
+}
+```
+
+Use `cez mcp` instead of `npx -y cezar-run mcp` when cezar is installed as a
+command.
+
+**Finding the cockpit.** `--url http://127.0.0.1:4321`, else `CEZ_API_URL`,
+else `cez mcp` probes `GET /api/v1/health` on `127.0.0.1:4321`–`4370`. One
+cockpit found is the answer; with several, the one with a project holding the
+agent's working directory is, and when none does the tools say so and ask for
+`--url` rather than guess. The handshake never needs a cockpit — a missing one is
+a readable tool error — and a cockpit restarted on another port is found again
+on the next call. Inside a cezar task an absent `CEZ_API_URL` still means the
+cockpit withheld it, so `cez mcp` does not probe there.
+
+**Flags.** `--project <id>` sets the project tools target when a call names
+none (else `CEZ_PROJECT_ID`, else the project holding the working directory,
+else the cockpit's own). `--read-only` registers only the read tools —
+`start_run` and `cancel_run` do not exist for that client, they are not just
+marked. `--header "Name: value"` (repeatable) adds a header for a cockpit behind
+a proxy (Basic auth, Cloudflare Access).
+
+**Tools.** Names are snake_case, arguments camelCase as in the API contract.
+Every tool declares `readOnlyHint`, `destructiveHint`, `idempotentHint` and
+`openWorldHint`, and answers with `structuredContent` matching its
+`outputSchema`.
+
+| Tool | What it does | Route |
+| --- | --- | --- |
+| `list_projects` | projects the cockpit serves | `GET /projects` |
+| `list_workflows` | workflows `start_run` accepts | `GET /workflows` |
+| `list_models` | models a runner can use here | `GET /models` |
+| `list_runs` | runs across projects, newest first; filter by project/status | `GET /workspace/runs-index` |
+| `get_run` | the full run record, long text clipped | `GET /runs/:id` |
+| `get_run_status` | compact status — cheap to poll | `GET /runs/:id` |
+| `list_run_events` | transcript events, oldest first; `afterSeq` reads only what is new | `GET /runs/:id/history` |
+| `wait_for_runs` | wait (≤ 45 s) until runs settle | `GET /runs/:id`, polled |
+| `get_pr_status` | PR/issue status on GitHub | `GET /github/ref-status` |
+| `start_run` | start a run from a named workflow; returns at once | `POST /runs` |
+| `cancel_run` | stop a run (destructive) | `POST /runs/:id/cancel` |
+
+**Start, then wait — never block for a whole run.** `start_run` returns the run
+id immediately. `wait_for_runs` returns as soon as a run is `done`, `failed`,
+`cancelled` or parked at `waiting`/`review` (`mode: "all"` waits for every run),
+or after `timeoutSeconds` (default 40, max 45) with `timedOut: true` — then just
+call it again with the same ids:
+
+```text
+start_run { workflow: "quick-task", task: "…" }        → { id: "4f1c…", status: "queued" }
+wait_for_runs { runIds: ["4f1c…"] }                    → { runs: [{ status: "running" }], timedOut: true }
+wait_for_runs { runIds: ["4f1c…"] }                    → { runs: [{ status: "review" }], timedOut: false }
+list_run_events { runId: "4f1c…", afterSeq: 0 }        → what the agent did
+```
+
+A run at `waiting` or `review` needs a person in the cockpit.
 
 ### The HTTP API
 
