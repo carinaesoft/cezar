@@ -315,6 +315,25 @@ describe('cez mcp tools: list_run_events', () => {
     expect(body.events[0]?.seq).toBe(10_000 - (EVENTS_MAX_WALK_PAGES + 1) * 100 + 1);
   });
 
+  it("a page's leading turn opener does not count as coverage, and seq gaps do not stop the walk", async () => {
+    // As `/history` really pages a long turn: every page leads with the turn's opener (seq 6),
+    // and ephemeral deltas leave every third seq out of the file.
+    const opener = { seq: 6, ts: '2026-10-13T10:00:00.000Z', type: 'turn.started' };
+    const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => from + i).filter((s) => s % 3 !== 0).map(ev);
+    const pages: Record<string, unknown> = {
+      tip: { ...page(0, -1, 'c1'), events: [opener, ...range(202, 400)] },
+      c1: { ...page(0, -1, 'c2'), events: [opener, ...range(102, 201)] },
+      c2: { ...page(0, -1), events: [opener, ...range(7, 101)] },
+    };
+    const mcp = await connect({ 'GET /api/v1/p/default/runs/r1/history': (url) => ({ body: pages[url.searchParams.get('cursor') ?? 'tip'] }) });
+    const result = await mcp.callTool({ name: 'list_run_events', arguments: { runId: 'r1', afterSeq: 100 } });
+    const body = result.structuredContent as { events: Array<{ seq: number }>; gap?: boolean };
+    expect(body.gap).toBeUndefined();
+    expect(body.events[0]?.seq).toBe(101);
+    expect(body.events.at(-1)?.seq).toBe(400);
+    expect(body.events.map((e) => e.seq)).toEqual(range(101, 400).map((e) => e.seq));
+  });
+
   it('a cursor is passed through to /history', async () => {
     const calls: Call[] = [];
     const mcp = await connect({ 'GET /api/v1/p/default/runs/r1/history': { body: page(1, 10) } }, { calls });

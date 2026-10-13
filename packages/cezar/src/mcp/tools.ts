@@ -62,6 +62,8 @@ const SETTLED = new Set(['done', 'failed', 'cancelled', 'waiting', 'review']);
 export const WAIT_MAX_SECONDS = 45;
 export const WAIT_DEFAULT_SECONDS = 40;
 export const WAIT_POLL_MS = 2_000;
+/** `GET /models` may ask a vendor CLI first, bounded at 15 s server-side — past the 10 s default. */
+const MODELS_TIMEOUT_MS = 30_000;
 /** Without `afterSeq` on `/history`, catching up walks back at most this many pages (100 items each). */
 export const EVENTS_MAX_WALK_PAGES = 5;
 
@@ -275,7 +277,10 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       annotations: { ...READ, openWorldHint: true },
     },
     ({ runner }) =>
-      read(async ({ api }) => runnerModelCatalogResponseSchema.parse(await readJson(await api.api.v1.models.$get({ query: { runner } })))),
+      read(async ({ api }) => {
+        const init = { signal: AbortSignal.timeout(MODELS_TIMEOUT_MS) };
+        return runnerModelCatalogResponseSchema.parse(await readJson(await api.api.v1.models.$get({ query: { runner } }, { init })));
+      }),
   );
 
   server.registerTool(
@@ -371,20 +376,22 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
         const first = await page(cursor);
         const bySeq = new Map(first.events.map((e) => [e.seq, e]));
         let olderCursor = first.hasOlder ? first.olderCursor : undefined;
-        const oldest = () => Math.min(...bySeq.keys());
-        // `/history` has no `afterSeq` (a separate PR, #1109): walk back from the tip, bounded,
-        // until the page that holds `afterSeq` is in hand. Pages can overlap by one turn
-        // boundary, hence the map.
+        let coveredFrom = pageStart(first.events);
+        // `/history` has no `afterSeq` yet (a separate PR, #1109): walk back from the tip, bounded,
+        // until a page starts at or below `afterSeq`.
         if (afterSeq !== undefined && cursor === undefined) {
-          for (let walked = 0; olderCursor && bySeq.size > 0 && oldest() > afterSeq && walked < EVENTS_MAX_WALK_PAGES; walked += 1) {
+          for (let walked = 0; olderCursor && coveredFrom > afterSeq && walked < EVENTS_MAX_WALK_PAGES; walked += 1) {
             const older = await page(olderCursor);
             for (const e of older.events) bySeq.set(e.seq, e);
+            coveredFrom = Math.min(coveredFrom, pageStart(older.events));
             olderCursor = older.hasOlder ? older.olderCursor : undefined;
           }
         }
-        const reached = afterSeq === undefined || bySeq.size === 0 || oldest() <= afterSeq || !olderCursor;
+        const reached = afterSeq === undefined || coveredFrom <= afterSeq || !olderCursor;
         const events = [...bySeq.values()]
-          .filter((e) => afterSeq === undefined || e.seq > afterSeq)
+          // With a gap, a page's leading turn opener sits below the read range — drop it, so
+          // "between afterSeq and the first event" is exactly what is left unread.
+          .filter((e) => (afterSeq === undefined ? true : e.seq > afterSeq && (reached || e.seq >= coveredFrom)))
           .sort((a, b) => a.seq - b.seq)
           .map((e) => clip(e, maxChars ?? 1_000));
         return eventsOutput.parse({
@@ -498,6 +505,19 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
   );
 
   return server;
+}
+
+/**
+ * Where a `/history` page's own range begins. A page leads with the opener of the turn it starts
+ * in (`pageEventSlice`, event-history.ts), which can sit far below the rest of the page; counting
+ * from it would claim events that were never read. Seqs have gaps (ephemeral deltas), so the
+ * range cannot be inferred from contiguity either. When the page's first item IS a turn opener,
+ * this under-claims by one event — costing at most one extra page, never a missed one.
+ */
+function pageStart(events: ReadonlyArray<{ seq: number; type: string }>): number {
+  const [head, next] = events;
+  if (!head) return Number.POSITIVE_INFINITY;
+  return next && (head.type === 'user-message' || head.type === 'turn.started') ? next.seq : head.seq;
 }
 
 interface WaitInput {
