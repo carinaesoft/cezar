@@ -505,7 +505,9 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
         'Remember asOfSeq and pass it back as afterSeq to read only what happened since; pass olderCursor / newerCursor ' +
         'from a previous answer to page. truncated: true means events were left out for size — continue with afterSeq: nextAfterSeq ' +
         '(plus the same cursor, if you passed one), or read the skipped older ones with afterSeq: skippedAfterSeq. ' +
-        'Cursors are short-lived — a seq is what to keep between calls.',
+        'Cursors are short-lived — a seq is what to keep between calls. ' +
+        'Seq numbers of stored events have holes (streamed deltas are not stored), so a jump between two seqs does not ' +
+        'mean an event is missing — only gap: true or truncated: true says something was left out.',
       inputSchema: runArgs.extend({
         cursor: runHistoryCursorSchema.optional().describe('olderCursor or newerCursor from a previous call.'),
         afterSeq: z.number().int().nonnegative().optional().describe('Only events with a seq greater than this.'),
