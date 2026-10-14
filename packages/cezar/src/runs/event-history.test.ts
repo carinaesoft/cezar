@@ -199,6 +199,100 @@ describe('readRunHistoryPage', () => {
   });
 });
 
+describe('readRunHistoryPage with afterSeq', () => {
+  const message = (seq: number) => ({
+    seq,
+    type: 'item.completed',
+    item: { kind: 'message', id: `m-${seq}`, role: 'assistant', text: String(seq) },
+  });
+  /** One turn opener, then 250 message items (seq 2–251), then a trailing non-item event. */
+  const transcript = () =>
+    fixture([
+      { seq: 1, type: 'turn.started', turnId: 't1' },
+      ...Array.from({ length: 250 }, (_, index) => message(index + 2)),
+      { seq: 252, type: 'turn.completed' },
+    ]);
+  const seqs = (page: { events: Array<{ seq: number }> }) => page.events.map(({ seq }) => seq);
+
+  it('afterSeq: 0 reads forward from the oldest event, one page, and says how to continue', async () => {
+    const file = transcript();
+    const page = await readRunHistoryPage(file, undefined, undefined, 0);
+    expect(page.afterSeq).toBe(0);
+    expect(seqs(page)[0]).toBe(1);
+    expect(page.itemCount).toBe(100);
+    expect(page.hasOlder).toBe(false);
+    expect(page.newerCursor).toBeTypeOf('string');
+    expect(page.asOfSeq).toBe(252);
+    // the next afterSeq is the last seq returned; the forward cursor lands on the same page
+    const next = await readRunHistoryPage(file, undefined, undefined, seqs(page).at(-1));
+    const viaCursor = await readRunHistoryPage(file, page.newerCursor);
+    expect(seqs(next)[0]).toBe(seqs(page).at(-1)! + 1);
+    expect(seqs(viaCursor).filter((seq) => seq > 1)).toEqual(seqs(next));
+  });
+
+  it('afterSeq in the middle returns only later events, oldest first, without the framing turn opener', async () => {
+    const page = await readRunHistoryPage(transcript(), undefined, undefined, 120);
+    expect(seqs(page)).toEqual(Array.from({ length: 100 }, (_, index) => 121 + index));
+    expect(page.hasOlder).toBe(true);
+    expect(page.olderCursor).toBeTypeOf('string');
+    expect(page.newerCursor).toBeTypeOf('string');
+  });
+
+  it('the last page runs to the end of the file, trailing non-item events included', async () => {
+    const page = await readRunHistoryPage(transcript(), undefined, undefined, 200);
+    expect(seqs(page)).toEqual(Array.from({ length: 52 }, (_, index) => 201 + index));
+    expect(page.newerCursor).toBeUndefined();
+    // only non-item events after afterSeq: still returned
+    const tail = await readRunHistoryPage(transcript(), undefined, undefined, 251);
+    expect(seqs(tail)).toEqual([252]);
+    expect(tail.itemCount).toBe(0);
+  });
+
+  it('afterSeq at or past the end answers an empty page with the echo', async () => {
+    for (const afterSeq of [252, 10_000]) {
+      const page = await readRunHistoryPage(transcript(), undefined, undefined, afterSeq);
+      expect(page).toMatchObject({ events: [], itemCount: 0, asOfSeq: 252, afterSeq });
+      expect(page.newerCursor).toBeUndefined();
+    }
+    expect(await readRunHistoryPage('/no/such/transcript.ndjson', undefined, undefined, 5)).toMatchObject({ events: [], afterSeq: 5 });
+  });
+
+  it('without afterSeq the page carries no echo', async () => {
+    expect(await readRunHistoryPage(transcript())).not.toHaveProperty('afterSeq');
+  });
+
+  it('near the tip of a 50,000-item transcript it reads a bounded slice, not the whole prefix', async () => {
+    const events: Array<Partial<RunEvent> & Pick<RunEvent, 'seq' | 'type'>> = [];
+    for (let index = 0; index < 50_000; index += 1) {
+      const seq = index * 2 + 1;
+      events.push({ seq, type: 'turn.started', turnId: `t-${index}` });
+      events.push({ seq: seq + 1, type: 'item.completed', item: { kind: 'message', id: `m-${index}`, role: 'assistant', text: `message ${index}` } });
+    }
+    const file = fixture(events);
+    let measured: { fileSize: number; bytesRead: number } | undefined;
+    const page = await readRunHistoryPage(file, undefined, (value) => {
+      measured = value;
+    }, 99_900);
+    expect(seqs(page)).toEqual(Array.from({ length: 100 }, (_, index) => 99_901 + index));
+    expect(measured!.bytesRead).toBeLessThan(measured!.fileSize / 10);
+    // in the middle it is still exact
+    const middle = await readRunHistoryPage(file, undefined, undefined, 50_001);
+    expect(seqs(middle)[0]).toBe(50_002);
+    expect(seqs(middle)).toHaveLength(199);
+    expect(seqs(middle).at(-1)).toBe(50_200);
+  });
+
+  it('an event line longer than a read chunk does not throw the seek off', async () => {
+    const events: Array<Partial<RunEvent> & Pick<RunEvent, 'seq' | 'type'>> = [{ seq: 1, type: 'turn.started' }];
+    for (let seq = 2; seq <= 40; seq += 1) events.push({ ...message(seq), item: { kind: 'message', id: `m-${seq}`, role: 'assistant', text: 'x'.repeat(100_000) } });
+    const file = fixture(events);
+    for (const afterSeq of [0, 7, 20, 39, 40]) {
+      const page = await readRunHistoryPage(file, undefined, undefined, afterSeq);
+      expect(seqs(page), `afterSeq ${afterSeq}`).toEqual(Array.from({ length: 40 - afterSeq }, (_, index) => afterSeq + 1 + index).filter((seq) => seq > afterSeq));
+    }
+  });
+});
+
 describe('live cursor replay and compact context', () => {
   it('replays only persisted lines appended after the captured live cursor', async () => {
     const file = fixture([

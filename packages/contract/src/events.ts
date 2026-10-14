@@ -39,10 +39,17 @@ export type RunIdParam = z.infer<typeof runIdParamSchema>;
 export const runHistoryCursorSchema = z.string().min(1).max(2_048);
 export type RunHistoryCursor = z.infer<typeof runHistoryCursorSchema>;
 
-/** Query accepted by the reverse-paged history endpoint. */
-export const runHistoryQuerySchema = z.object({
-  cursor: runHistoryCursorSchema.optional(),
-});
+/** Query accepted by the reverse-paged history endpoint. `afterSeq` reads forward from a seq a
+ *  client kept (cursors are short-lived), so it cannot be combined with a cursor (#1109). */
+export const runHistoryQuerySchema = z
+  .object({
+    cursor: runHistoryCursorSchema.optional(),
+    afterSeq: z.coerce.number().int().nonnegative().optional(),
+  })
+  .refine((query) => query.cursor === undefined || query.afterSeq === undefined, {
+    message: 'pass either cursor or afterSeq, not both',
+    path: ['afterSeq'],
+  });
 export type RunHistoryQuery = z.infer<typeof runHistoryQuerySchema>;
 
 /** Additive resume controls for the existing per-run SSE endpoint. */
@@ -75,6 +82,9 @@ export const runHistoryPageSchema = z.object({
   liveCursor: runHistoryCursorSchema,
   asOfSeq: z.number().int().nonnegative(),
   hasOlder: z.boolean(),
+  /** Echo of the request's `afterSeq`: present only when the cockpit honoured it, so a client can
+   *  tell an answer from a cockpit that predates the parameter and ignored it. */
+  afterSeq: z.number().int().nonnegative().optional(),
 });
 export type RunHistoryPage = z.infer<typeof runHistoryPageSchema>;
 

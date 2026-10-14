@@ -23,6 +23,7 @@ describe('cez mcp tools over the real /api/v1 router', () => {
   let app: Hono;
   let started: Array<{ workflow: string; input: Record<string, unknown> }>;
   let cancelled: string[];
+  let requests: string[];
   let mcp: Client;
   const saved = { dryRun: process.env.CEZ_DRY_RUN, home: process.env.CEZ_HOME };
 
@@ -34,6 +35,7 @@ describe('cez mcp tools over the real /api/v1 router', () => {
     store = RunStore.open(join(repoRoot, '.ai/cezar'));
     started = [];
     cancelled = [];
+    requests = [];
     const manager = {
       startRun: (workflow: { name: string }, input: { task: string } & Record<string, unknown>) => {
         started.push({ workflow: workflow.name, input });
@@ -47,7 +49,11 @@ describe('cez mcp tools over the real /api/v1 router', () => {
     app = createApp({ repoRoot, store, manager, version: '0.0.0-test' });
     const api = createApiClient({
       baseUrl: 'http://127.0.0.1:4321',
-      fetch: (input, init) => apiRequest(app, input instanceof Request ? input.url : String(input), init),
+      fetch: (input, init) => {
+        const url = input instanceof Request ? input.url : String(input);
+        requests.push(url);
+        return apiRequest(app, url, init);
+      },
     });
     const server = buildMcpServer({ cockpit: async () => ({ api, defaultProjectId: 'default' }), version: '0.0.0-test', pollIntervalMs: 10 });
     const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
@@ -130,5 +136,19 @@ describe('cez mcp tools over the real /api/v1 router', () => {
     expect((await call('list_runs')).structuredContent).toMatchObject({ runs: [], total: 0 });
     const events = (await call('list_run_events', { runId: run.id })).structuredContent as { events: Array<{ type: string }> };
     expect(events.events.map((e) => e.type)).toContain('text');
+  });
+
+  it('list_run_events with afterSeq reads forward in one /history request', async () => {
+    const run = store.createRun({ title: 't', workflow: 'quick-task', task: 't', steps: [] });
+    store.appendEvent(run.id, { type: 'turn.started', turnId: 't1' });
+    for (let i = 0; i < 400; i += 1) store.appendEvent(run.id, { type: 'note', message: `n${i}` });
+    requests.length = 0;
+    const result = await call('list_run_events', { runId: run.id, afterSeq: 50, maxEvents: 500 });
+    const body = result.structuredContent as { events: Array<{ seq: number }>; nextAfterSeq?: number; gap?: boolean };
+    expect(requests.filter((u) => u.includes('/history'))).toEqual([expect.stringMatching(/\/history\?afterSeq=50$/)]);
+    expect(body.events[0]?.seq).toBe(51);
+    expect(body.events.every((e, i, all) => e.seq > 50 && (i === 0 || e.seq > all[i - 1]!.seq))).toBe(true);
+    expect(body.gap).toBeUndefined();
+    expect(body.nextAfterSeq).toBe(body.events.at(-1)?.seq);
   });
 });
