@@ -83,11 +83,14 @@ const ALL_TOOLS = [
   'get_pr_status',
   'start_run',
   'cancel_run',
+  'push_run_branch',
+  'send_run_message',
+  'review_run',
 ];
-const WRITE_TOOLS = ['start_run', 'cancel_run'];
+const WRITE_TOOLS = ['start_run', 'cancel_run', 'push_run_branch', 'send_run_message', 'review_run'];
 
 describe('cez mcp tools: registration', () => {
-  it('registers the eleven tools, each stating all four hints and an object output schema', async () => {
+  it('registers the fourteen tools, each stating all four hints and an object output schema', async () => {
     const mcp = await connect({});
     const { tools } = await mcp.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([...ALL_TOOLS].sort());
@@ -104,6 +107,13 @@ describe('cez mcp tools: registration', () => {
     expect(byName.cancel_run?.destructiveHint).toBe(true);
     expect(byName.start_run?.destructiveHint).toBe(false);
     expect(byName.start_run?.idempotentHint).toBe(false);
+    // A push reaches the remote; an answer or a send-back wakes an agent that acts on the world.
+    for (const name of ['push_run_branch', 'send_run_message', 'review_run']) expect(byName[name]?.openWorldHint, name).toBe(true);
+    // Accept merges nothing and a push never forces: neither destroys anything.
+    for (const name of ['push_run_branch', 'send_run_message', 'review_run']) expect(byName[name]?.destructiveHint, name).toBe(false);
+    expect(byName.push_run_branch?.idempotentHint).toBe(true);
+    expect(byName.send_run_message?.idempotentHint).toBe(false);
+    expect(byName.review_run?.idempotentHint).toBe(false);
   });
 
   it('read-only mode does not register the write tools at all', async () => {
@@ -113,6 +123,9 @@ describe('cez mcp tools: registration', () => {
     await expect(mcp.callTool({ name: 'start_run', arguments: { workflow: 'quick-task', task: 'x' } })).rejects.toThrow(
       /Tool start_run not found/,
     );
+    for (const name of ['push_run_branch', 'send_run_message', 'review_run']) {
+      await expect(mcp.callTool({ name, arguments: { runId: 'r1' } }), name).rejects.toThrow(new RegExp(`Tool ${name} not found`));
+    }
   });
 
   it('argument names are camelCase, like the contract', async () => {
@@ -585,6 +598,268 @@ describe('cez mcp tools: start_run and cancel_run', () => {
     const result = await mcp.callTool({ name: 'cancel_run', arguments: { runId: 'r1' } });
     expect(result.structuredContent).toEqual({ cancelled: true });
     expect(calls.map((c) => `${c.method} ${c.url.pathname}`)).toEqual(['POST /api/v1/p/default/runs/r1/cancel']);
+  });
+});
+
+describe('cez mcp tools: push_run_branch, send_run_message, review_run', () => {
+  const R = '/api/v1/p/default/runs/r1';
+  const posts = (calls: Call[]) => calls.filter((c) => c.method === 'POST').map((c) => c.url.pathname);
+
+  describe('push_run_branch', () => {
+    it('posts to git/push with no body and names the branch, remote and newest commit', async () => {
+      const calls: Call[] = [];
+      const mcp = await connect(
+        {
+          [`GET ${R}`]: { body: run('r1', 'review') },
+          [`POST ${R}/git/push`]: { body: { pushed: true, branch: 'cez/r1', remote: 'origin', upstreamSet: true } },
+          [`GET ${R}/commits`]: {
+            body: { commits: [{ sha: 'abc123', subject: 'fix: it', author: 'a', when: 'now' }, { sha: 'def', subject: 'b', author: 'a', when: 'then' }] },
+          },
+        },
+        { calls },
+      );
+      const result = await mcp.callTool({ name: 'push_run_branch', arguments: { runId: 'r1' } });
+      expect(result.isError, textOf(result)).toBeFalsy();
+      expect(result.structuredContent).toEqual({
+        pushed: true,
+        branch: 'cez/r1',
+        remote: 'origin',
+        upstreamSet: true,
+        projectId: 'default',
+        runId: 'r1',
+        head: { sha: 'abc123', subject: 'fix: it' },
+        commits: 2,
+      });
+      expect(posts(calls)).toEqual([`${R}/git/push`]);
+      expect(calls.find((c) => c.method === 'POST')?.body).toBeUndefined();
+    });
+
+    it('takes no force, remote or branch argument', async () => {
+      const mcp = await connect({});
+      const tool = (await mcp.listTools()).tools.find((t) => t.name === 'push_run_branch');
+      expect(Object.keys(tool?.inputSchema.properties ?? {}).sort()).toEqual(['projectId', 'runId']);
+    });
+
+    it('a pushed branch whose log cannot be read still reports the push', async () => {
+      const mcp = await connect({
+        [`GET ${R}`]: { body: run('r1', 'done') },
+        [`POST ${R}/git/push`]: { body: { pushed: true, branch: 'b', remote: 'origin', upstreamSet: false } },
+        [`GET ${R}/commits`]: { status: 409, body: { error: 'no worktree' } },
+      });
+      const result = await mcp.callTool({ name: 'push_run_branch', arguments: { runId: 'r1' } });
+      expect(result.structuredContent).toEqual({ pushed: true, branch: 'b', remote: 'origin', upstreamSet: false, projectId: 'default', runId: 'r1' });
+    });
+
+    it.each([
+      ['this cockpit', 'push rejected: [rejected] cez/r1 -> cez/r1 (non-fast-forward)', /non-fast-forward\)\. cez mcp does not force-push: have the run merge the remote branch/],
+      ['an older cockpit', 'To /srv/bare.git', /only the destination line; usually the remote branch has commits this branch lacks\)\. cez mcp does not force-push$/],
+    ])('a rejected push from %s is a readable error, sent once', async (_, reason, expected) => {
+      const calls: Call[] = [];
+      const mcp = await connect(
+        { [`GET ${R}`]: { body: run('r1', 'review') }, [`POST ${R}/git/push`]: { status: 409, body: { error: reason } } },
+        { calls },
+      );
+      const result = await mcp.callTool({ name: 'push_run_branch', arguments: { runId: 'r1' } });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toMatch(new RegExp(`^cezar refused: 409: ${reason.replace(/[[\]()/.]/g, '\\$&')} — `));
+      expect(textOf(result)).toMatch(expected);
+      expect(posts(calls)).toEqual([`${R}/git/push`]);
+    });
+
+    it('any other refusal is relayed as is', async () => {
+      const mcp = await connect({
+        [`GET ${R}`]: { body: run('r1', 'done') },
+        [`POST ${R}/git/push`]: { status: 409, body: { error: 'no remote configured — add one with `git remote add origin <url>`' } },
+      });
+      const result = await mcp.callTool({ name: 'push_run_branch', arguments: { runId: 'r1' } });
+      expect(textOf(result)).toBe('cezar refused: 409: no remote configured — add one with `git remote add origin <url>`');
+    });
+  });
+
+  describe('send_run_message', () => {
+    it.each([
+      ['waiting', { delivered: true }],
+      ['running', { delivered: true }],
+      ['queued', { queued: true, message: { id: 'm1', text: 'and this', createdAt: '2026-10-13T10:00:00.000Z' } }],
+    ])('at %s posts the text to /messages and relays the answer', async (status, answer) => {
+      const calls: Call[] = [];
+      const mcp = await connect({ [`GET ${R}`]: { body: run('r1', status) }, [`POST ${R}/messages`]: { body: answer } }, { calls });
+      const result = await mcp.callTool({ name: 'send_run_message', arguments: { runId: 'r1', text: 'Yes, use option B' } });
+      expect(result.isError, textOf(result)).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({ ...answer, projectId: 'default', runId: 'r1', status });
+      expect(posts(calls)).toEqual([`${R}/messages`]);
+      expect(calls.find((c) => c.method === 'POST')?.body).toEqual({ text: 'Yes, use option B' });
+    });
+
+    it.each([
+      ['done', /run r1 is done: send_run_message reaches only a waiting, running or queued run — it is finished — cez mcp does not reopen finished runs/],
+      ['failed', /run r1 is failed: .* does not reopen finished runs/],
+      ['cancelled', /run r1 is cancelled: .* does not reopen finished runs/],
+      ['review', /run r1 is review: .* — decide with review_run$/],
+    ])('at %s refuses with the status, and posts nothing', async (status, expected) => {
+      const calls: Call[] = [];
+      const mcp = await connect({ [`GET ${R}`]: { body: run('r1', status) } }, { calls });
+      const result = await mcp.callTool({ name: 'send_run_message', arguments: { runId: 'r1', text: 'hi' } });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toMatch(expected);
+      expect(posts(calls)).toEqual([]);
+    });
+
+    it("a session that closed after the status read is the route's 409 with the status it ended at", async () => {
+      let reads = 0;
+      const mcp = await connect({
+        [`GET ${R}`]: () => ({ body: run('r1', (reads += 1) === 1 ? 'waiting' : 'done') }),
+        [`POST ${R}/messages`]: { status: 409, body: { error: 'session closed' } },
+      });
+      const result = await mcp.callTool({ name: 'send_run_message', arguments: { runId: 'r1', text: 'hi' } });
+      expect(textOf(result)).toMatch(/^cezar refused: 409: session closed — run r1 is done: /);
+    });
+
+    it('refuses an empty message before anything reaches the cockpit', async () => {
+      const calls: Call[] = [];
+      const mcp = await connect({}, { calls });
+      const result = await mcp.callTool({ name: 'send_run_message', arguments: { runId: 'r1', text: '   ' } });
+      expect(result.isError).toBe(true);
+      expect(calls).toEqual([]);
+    });
+  });
+
+  describe('review_run', () => {
+    it('accept posts /finish — and nothing else — and reports the status after it', async () => {
+      const calls: Call[] = [];
+      let reads = 0;
+      const mcp = await connect(
+        { [`GET ${R}`]: () => ({ body: run('r1', (reads += 1) === 1 ? 'review' : 'done') }), [`POST ${R}/finish`]: { body: { finished: true } } },
+        { calls },
+      );
+      const result = await mcp.callTool({ name: 'review_run', arguments: { runId: 'r1', decision: 'accept' } });
+      expect(result.isError, textOf(result)).toBeFalsy();
+      expect(result.structuredContent).toEqual({ finished: true, projectId: 'default', runId: 'r1', decision: 'accept', status: 'done' });
+      expect(posts(calls)).toEqual([`${R}/finish`]);
+    });
+
+    it('send_back posts the notes to /continue with the review panel\'s prefix', async () => {
+      const calls: Call[] = [];
+      let reads = 0;
+      const mcp = await connect(
+        { [`GET ${R}`]: () => ({ body: run('r1', (reads += 1) === 1 ? 'review' : 'running') }), [`POST ${R}/continue`]: { body: { continued: true } } },
+        { calls },
+      );
+      const result = await mcp.callTool({ name: 'review_run', arguments: { runId: 'r1', decision: 'send_back', notes: '  Rename foo to bar.  ' } });
+      expect(result.structuredContent).toEqual({ continued: true, projectId: 'default', runId: 'r1', decision: 'send_back', status: 'running' });
+      expect(posts(calls)).toEqual([`${R}/continue`]);
+      expect(calls.find((c) => c.method === 'POST')?.body).toEqual({ text: 'Review feedback:\nRename foo to bar.' });
+    });
+
+    it.each(['waiting', 'running', 'done', 'failed'])('at %s refuses with the status, and posts nothing', async (status) => {
+      const calls: Call[] = [];
+      const mcp = await connect({ [`GET ${R}`]: { body: run('r1', status) } }, { calls });
+      for (const decision of ['accept', 'send_back']) {
+        const result = await mcp.callTool({ name: 'review_run', arguments: { runId: 'r1', decision, ...(decision === 'send_back' ? { notes: 'x' } : {}) } });
+        expect(result.isError).toBe(true);
+        expect(textOf(result)).toBe(`run r1 is ${status}, not review — review_run only decides at the review gate`);
+      }
+      expect(posts(calls)).toEqual([]);
+    });
+
+    it.each([
+      [{ decision: 'send_back' }, 'send_back needs notes: write what to change'],
+      [{ decision: 'send_back', notes: '  ' }, 'send_back needs notes: write what to change'],
+      [{ decision: 'accept', notes: 'looks good' }, 'accept takes no notes — use send_back to send them to the agent'],
+    ])('%j is refused before anything reaches the cockpit', async (args, expected) => {
+      const calls: Call[] = [];
+      const mcp = await connect({}, { calls });
+      const result = await mcp.callTool({ name: 'review_run', arguments: { runId: 'r1', ...args } });
+      expect(textOf(result)).toBe(expected);
+      expect(calls).toEqual([]);
+    });
+
+    it.each([
+      ['accept', 'finish', 'no open session'],
+      ['send_back', 'continue', 'run is still active'],
+    ])("%s relays the route's 409 and says the run may still be settling", async (decision, route, reason) => {
+      const mcp = await connect({
+        [`GET ${R}`]: { body: run('r1', 'review') },
+        [`POST ${R}/${route}`]: { status: 409, body: { error: reason } },
+      });
+      const result = await mcp.callTool({ name: 'review_run', arguments: { runId: 'r1', decision, ...(decision === 'send_back' ? { notes: 'x' } : {}) } });
+      expect(textOf(result)).toBe(`cezar refused: 409: ${reason} — the run is still being resumed or settled; wait_for_runs, then decide again`);
+    });
+
+    it('send_back answers once its continuation has started, not with the stale review', async () => {
+      // /continue starts the session asynchronously: the record reads review, its step pending, for a moment.
+      const states = [
+        run('r1', 'review', { steps: [{ id: 'task', status: 'done' }] }),
+        run('r1', 'review', { steps: [{ id: 'task', status: 'done' }, { id: 'continue-1', status: 'pending' }] }),
+        run('r1', 'review', { steps: [{ id: 'task', status: 'done' }, { id: 'continue-1', status: 'pending' }] }),
+        run('r1', 'running', { steps: [{ id: 'task', status: 'done' }, { id: 'continue-1', status: 'running' }] }),
+      ];
+      let reads = 0;
+      const mcp = await connect({
+        [`GET ${R}`]: () => ({ body: states[Math.min((reads += 1) - 1, states.length - 1)] }),
+        [`POST ${R}/continue`]: { body: { continued: true } },
+      });
+      const result = await mcp.callTool({ name: 'review_run', arguments: { runId: 'r1', decision: 'send_back', notes: 'x' } });
+      expect((result.structuredContent as { status: string }).status).toBe('running');
+      expect(reads).toBe(4);
+    });
+
+    it('send_back that already re-parked at review says review, without waiting it out', async () => {
+      const parked = run('r1', 'review', { steps: [{ id: 'task', status: 'done' }, { id: 'continue-1', status: 'done' }] });
+      let reads = 0;
+      const mcp = await connect({
+        [`GET ${R}`]: () => ({ body: (reads += 1) === 1 ? run('r1', 'review') : parked }),
+        [`POST ${R}/continue`]: { body: { continued: true } },
+      });
+      const result = await mcp.callTool({ name: 'review_run', arguments: { runId: 'r1', decision: 'send_back', notes: 'x' } });
+      expect((result.structuredContent as { status: string }).status).toBe('review');
+      expect(reads).toBe(2);
+    });
+  });
+
+  describe('choosing the project', () => {
+    const index = (runs: Array<{ id: string; projectId: string }>) => ({
+      body: { runs: runs.map((r) => ({ ...r, status: 'review', createdAt: '2026-09-01', archived: false, title: 't', workflow: 'q' })), truncated: [], perProjectLimit: 200, referenceStatuses: {} },
+    });
+    const projects = { body: { bootProject: 'a', projectsDir: '/', projects: [{ id: 'a', name: 'Repo A', root: '/a', status: 'ok' }, { id: 'b', name: 'b', root: '/b', status: 'ok' }] } };
+    const args = { push_run_branch: {}, send_run_message: { text: 'hi' }, review_run: { decision: 'accept' } };
+
+    it.each(Object.entries(args))('%s does not follow a run into another project: it names it', async (name, extra) => {
+      const calls: Call[] = [];
+      const mcp = await connect({ 'GET /api/v1/workspace/runs-index': index([{ id: 'r1', projectId: 'b' }]), 'GET /api/v1/projects': projects }, { calls });
+      const result = await mcp.callTool({ name, arguments: { runId: 'r1', ...extra } });
+      expect(textOf(result)).toBe('cezar refused: 404: not found — run r1 belongs to project "b"; pass projectId: "b"');
+      expect(posts(calls)).toEqual([]);
+    });
+
+    it.each(Object.entries(args))('%s with a run no project places: lists the projects and asks for projectId', async (name, extra) => {
+      const mcp = await connect({ 'GET /api/v1/workspace/runs-index': index([]), 'GET /api/v1/projects': projects });
+      const result = await mcp.callTool({ name, arguments: { runId: 'r1', ...extra } });
+      expect(textOf(result)).toBe(
+        'cezar refused: 404: not found — no project of this cockpit has a run r1 — check the id (list_runs); ' +
+          'this cockpit serves 2 projects (a (Repo A), b) — pass projectId to say which one holds it',
+      );
+    });
+
+    it('a named project is used as is', async () => {
+      const calls: Call[] = [];
+      const mcp = await connect(
+        { 'GET /api/v1/p/b/runs/r1': { body: run('r1', 'review') }, 'POST /api/v1/p/b/runs/r1/finish': { body: { finished: true } } },
+        { calls },
+      );
+      const result = await mcp.callTool({ name: 'review_run', arguments: { projectId: 'b', runId: 'r1', decision: 'accept' } });
+      expect((result.structuredContent as { projectId: string }).projectId).toBe('b');
+      expect(posts(calls)).toEqual(['/api/v1/p/b/runs/r1/finish']);
+    });
+
+    it.each(Object.entries(args))('%s refuses when discovery could not rule out another cockpit', async (name, extra) => {
+      const calls: Call[] = [];
+      const api = createApiClient({ baseUrl: 'http://127.0.0.1:4321', fetch: stubFetch({}, calls) });
+      const mcp = await connect({}, { cockpit: async () => ({ api, defaultProjectId: 'default', writeRefused: 'port 4322 did not answer' }) });
+      const result = await mcp.callTool({ name, arguments: { runId: 'r1', ...extra } });
+      expect(textOf(result)).toBe('port 4322 did not answer');
+      expect(calls).toEqual([]);
+    });
   });
 });
 

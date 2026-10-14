@@ -587,7 +587,8 @@ startup_timeout_sec = 60
 tool_timeout_sec = 60
 ```
 
-Codex asks before every write tool (`start_run`, `cancel_run`). `codex exec`
+Codex asks before every write tool (`start_run`, `cancel_run`, `push_run_branch`,
+`send_run_message`, `review_run`). `codex exec`
 cannot ask, so there an unapproved `start_run` fails. Approve cezar's tools up
 front, either all of them:
 
@@ -631,8 +632,8 @@ is asked once more with 3 s; if it still says nothing, the choice is made withou
 it, `cez mcp` names that port on stderr and in the answer itself (`warnings` in
 `structuredContent`, plus one `warning:` line of text), and the answer is used
 for that call only — the next call looks again. That silent port may be the cockpit the working
-directory belongs to, so only reads go ahead without it: `start_run` and
-`cancel_run` send nothing and fail naming the port, asking for `--url` (or
+directory belongs to, so only reads go ahead without it: every write tool
+sends nothing and fails naming the port, asking for `--url` (or
 `CEZ_API_URL`), and work again once that port answers. Inside a cezar task an absent `CEZ_API_URL` still means the
 cockpit withheld it, so `cez mcp` does not probe there.
 
@@ -650,15 +651,17 @@ nothing is remembered: reads fall back to the boot project for that call,
 reads the registry again. A run id
 is global: a read tool (`get_run`, `get_run_status`, `list_run_events`,
 `wait_for_runs`) given no `projectId` follows a run that lives in another
-project; `cancel_run` does not guess and names the project to pass instead. A
-run no project has is reported as such. `start_run`, `get_run`,
+project; the write tools (`cancel_run`, `push_run_branch`, `send_run_message`,
+`review_run`) do not guess and name the project to pass instead. A
+run no project has is reported as such — by a write tool with the list of
+projects (id and name) to pass as `projectId`. `start_run`, `get_run`,
 `get_run_status` and `wait_for_runs` answer with the run's `projectId`.
 
 **Flags.** `--project <id>` sets the project tools target when a call names
 none (else `CEZ_PROJECT_ID`, else the project holding the working directory;
 reads then fall back to the cockpit's own). `--read-only` registers only the read tools —
-`start_run` and `cancel_run` do not exist for that client, they are not just
-marked. `--header "Name: value"` (repeatable) adds a header for a cockpit behind
+`start_run`, `cancel_run`, `push_run_branch`, `send_run_message` and
+`review_run` do not exist for that client, they are not just marked. `--header "Name: value"` (repeatable) adds a header for a cockpit behind
 a proxy (Basic auth, Cloudflare Access).
 
 **A cockpit on another machine.** From a laptop to a cockpit on the LAN (or
@@ -697,6 +700,9 @@ Every tool declares `readOnlyHint`, `destructiveHint`, `idempotentHint` and
 | `get_pr_status` | PR/issue status on GitHub | `GET /github/ref-status` |
 | `start_run` | start a run from a named workflow; returns at once | `POST /runs` |
 | `cancel_run` | stop a run (destructive) | `POST /runs/:id/cancel` |
+| `push_run_branch` | push the run's branch (never forced); answers branch, remote, newest commit | `POST /runs/:id/git/push` |
+| `send_run_message` | answer a `waiting` run (also reaches `running`, stacks on `queued`) | `POST /runs/:id/messages` |
+| `review_run` | the review gate: `accept`, or `send_back` with `notes` | `POST /runs/:id/finish` / `/continue` |
 
 **Start, then wait — never block for a whole run.** `start_run` returns the run
 id immediately. `wait_for_runs` returns as soon as a run is `done`, `failed`,
@@ -711,7 +717,37 @@ wait_for_runs { runIds: ["4f1c…"] }                    → { runs: [{ status: 
 list_run_events { runId: "4f1c…", afterSeq: 0 }        → what the agent did
 ```
 
-A run at `waiting` or `review` needs a person in the cockpit. `mode: "any"`
+**Answer, review, publish.** The write tools do what the cockpit's buttons do,
+and only that:
+
+- `send_run_message { runId, text }` is the composer: at `waiting` the text goes
+  into the open session and the run works again. At any status other than
+  `waiting`, `running` or `queued` it is an error naming the status — it never
+  reopens a finished run (the cockpit's Continue does).
+- `review_run { runId, decision }` is the review gate, and only at `review`.
+  `accept` is ✓ Accept: the run is marked `done` and nothing else happens —
+  no merge, commit, push or PR; the worktree and branch stay. `send_back` with
+  `notes` is ↩ Send back: the notes reach the agent's session as
+  `Review feedback:` and the run works, then parks again. The review panel's
+  Draft PR is not a tool.
+- `push_run_branch { runId }` is the Push button: it pushes the committed branch
+  to the cockpit's push remote, setting the upstream the first time. There is no
+  force: a rejected push (the remote has commits the branch lacks) is an error,
+  not retried.
+
+```text
+start_run { workflow: "quick-task", task: "…" }                  → { id: "4f1c…", projectId: "repob", status: "queued" }
+wait_for_runs { runIds: ["4f1c…"] }                              → { runs: [{ status: "waiting" }] }
+list_run_events { runId: "4f1c…", afterSeq: 0 }                  → the agent's question
+send_run_message { runId: "4f1c…", text: "Option B." }           → { delivered: true, status: "waiting" }
+wait_for_runs { runIds: ["4f1c…"] }                              → { runs: [{ status: "review" }] }
+review_run { runId: "4f1c…", decision: "send_back", notes: "…" } → { continued: true, status: "running" }
+wait_for_runs { runIds: ["4f1c…"] }                              → { runs: [{ status: "review" }] }
+review_run { runId: "4f1c…", decision: "accept" }                → { finished: true, status: "done" }
+push_run_branch { runId: "4f1c…" }                               → { pushed: true, branch: "cez/4f1c…", remote: "origin", head: { sha: "…" } }
+```
+
+With `--read-only`, a run at `waiting` or `review` needs a person in the cockpit. `mode: "any"`
 answers at once when a run has already settled. A `failed` run settles the wait
 even when it carries `autoResumeAt` (a provider usage limit) — cezar resumes it
 at that time by itself, so wait again after it.

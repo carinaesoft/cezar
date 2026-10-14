@@ -1212,6 +1212,32 @@ describe('commitAll / pushCurrentBranch — direct degradation paths', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('pushCurrentBranch names a non-fast-forward rejection, not git\'s "To <url>" line', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cez-nonff-'));
+    try {
+      const bare = join(root, 'bare.git');
+      const [a, b] = [join(root, 'a'), join(root, 'b')];
+      g(root, 'init', '-q', '--bare', bare);
+      for (const dir of [a, b]) {
+        mkdirSync(dir);
+        initRepo(dir);
+        g(dir, 'remote', 'add', 'origin', bare);
+      }
+      writeFileSync(join(a, 'a.txt'), 'a\n');
+      g(a, 'add', '-A');
+      g(a, 'commit', '-m', 'a');
+      expect((await pushCurrentBranch(a)).ok).toBe(true);
+      writeFileSync(join(b, 'b.txt'), 'b\n');
+      g(b, 'add', '-A');
+      g(b, 'commit', '-m', 'b');
+      const res = await pushCurrentBranch(b);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.error).toMatch(/^push rejected: \[rejected\] .* \((fetch first|non-fast-forward)\)$/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('worktreeGitStatus — what has not left the worktree', () => {
