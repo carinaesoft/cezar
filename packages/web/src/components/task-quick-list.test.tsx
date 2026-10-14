@@ -24,6 +24,7 @@ const HEALTH: HealthResponse = {
     singleProject: false,
     automations: false,
     dispatch: false,
+    mcp: 'off',
     tokenMetrics: true,
     tokenUsageMetrics: true,
     costMetrics: true,

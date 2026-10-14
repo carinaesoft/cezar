@@ -161,6 +161,7 @@ describe('resolveCapabilities — followups (#471)', () => {
       singleProject: false,
       automations: true,
       dispatch: true,
+      mcp: 'off',
       tokenMetrics: true,
       tokenUsageMetrics: true,
       costMetrics: true,
@@ -216,6 +217,7 @@ describe('resolveCapabilities — automations (spec 2026-09-14, default-on)', ()
       followups: false,
       singleProject: false,
       dispatch: true,
+      mcp: 'off',
     });
   });
 });
@@ -243,6 +245,7 @@ describe('resolveCapabilities — dispatch (spec 2026-09-10-dispatch)', () => {
   it('does not turn on any other opt-in capability', () => {
     expect(resolveCapabilities({})).toMatchObject({
       dispatch: true,
+      mcp: 'off',
       automations: true,
       followups: false,
       singleProject: false,

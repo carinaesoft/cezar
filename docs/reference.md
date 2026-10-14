@@ -7,7 +7,7 @@ Everything the [README](../README.md) leaves out: the full configuration, every 
 - [Multiple projects, one cockpit](#multiple-projects-one-cockpit)
 - [Workflow format](#workflow-format)
 - [How it runs agents](#how-it-runs-agents) (environment variables, troubleshooting)
-- [Talking to a running cockpit](#talking-to-a-running-cockpit) (`cez runs`, `cez task`, `cez automation`, `cez mcp`, the HTTP API)
+- [Talking to a running cockpit](#talking-to-a-running-cockpit) (`cez runs`, `cez task`, `cez automation`, `cez mcp`, `/api/v1/mcp`, the HTTP API)
 - [Coding agent backends](#coding-agent-backends)
 - [Remote access (host cezar on a server)](#remote-access-host-cezar-on-a-server)
 - [Configuration](#configuration-optional)
@@ -461,6 +461,7 @@ Useful environment variables:
 | `CEZ_AUTOMATIONS=0` | Turn **automations** off. On by default since the automations redesign (spec `.ai/specs/2026-09-14-automations-redesign.md`): the Automations view lists GitHub-triggered and scheduled automations, and cezar polls GitHub or fires schedules on each enabled one while it is running — nothing runs until you enable an automation yourself. An agent can also **create an automation from a prompt**: type "whenever a PR is opened, review it" into New task — pick the built-in `create-cezar-automation` skill, or just ask; every task's system prompt teaches it to recognise the intent — and the agent writes the definition and creates it through `cez automation create` (paused, with a `cez automation check` preview of what it would match), then links the Automations page. Only the exact value `0` opts out (`CEZ_AUTOMATIONS=1`, the old opt-in, is accepted and changes nothing); opted out, the nav item is absent, the endpoints answer `409`, and the workspace scheduler never starts. Read at boot, so restart after changing it; definitions, receipts and high-watermarks are kept either way. |
 | `CEZ_WORKFLOW_WEBHOOKS=1` | Let a workflow graph's **`notify.webhook`** node POST to the URL it names (JSON: `text`, `run`, `node`). Off by default: a workflow file — which can be imported from anywhere — calling out to an arbitrary URL widens exposure, so it is opt-in. Off, the node leaves by `failed` with a note; under `CEZ_DRY_RUN=1` nothing is sent either way. |
 | `CEZ_DISPATCH=0` | Turn OFF **task dispatch**, which is on by default: a running task may start other cezar tasks with `cez task create` — each in its OWN worktree forked off the parent's branch, with a budget carved out of the parent's — and they report back into the parent's session when they settle (`cez task report`). Children appear nested under their parent in the task lists. Tasks talk through a tree directory (`.ai/cezar/dispatch/<root>/`: the brief, each task's order/notes/report, an inbox per task) and cezar wakes a parked recipient when a file lands. A `--kind review` child judges another task's branch and answers with a verdict. ON by default (the owner-approved exception to "cost-widening features are opt-in" — see `AGENTS.md`), and only the exact value `0` turns it off; with it off the `/runs/:id/dispatch` and `/runs/:id/report` routes answer `409`, no task is told about the CLI, and the cockpit hides the "Review open PRs" template. A headless `cezar run` never dispatches either way — there is no cockpit for the CLI to reach, so no task is told about it. Read at boot, so restart after changing it. This is the widest cost-widening flag here — one task can start four more agents — so give dispatching tasks a budget. |
+| `CEZ_MCP=1` / `CEZ_MCP=read-only` | Serve the `cez mcp` tools from the cockpit itself at `/api/v1/mcp`, so an agent connects by URL ([details](#over-http-apiv1mcp)). `read-only` registers only the read tools. Off by default; any other value leaves the route absent (`404`) and the MCP SDK unloaded. `capabilities.mcp` in `/api/v1/health` reports `off`, `read-only` or `full`. Read at boot. |
 | `CEZ_AUTOSAVE=1` | Re-enable the periodic (90 s) autosave commit in task worktrees. Off by default (#471) — turn-end and pre-PR flushes always run, so branches still end complete. Every autosave names its trigger in the commit subject (`cezar autosave (periodic)` vs `(turn end)` / `(run finalize)` / `(pre-PR)`), so the flushes you keep are distinguishable from the timer you disabled. |
 | `CEZ_CLAUDE_BIN=/path/to/claude` | Override which `claude` binary is used. Rarely needed: when it is unset, cezar takes `claude` from PATH, and failing that looks where Claude Code's own installers put it — `~/.local/bin`, `~/.claude/local`, `/opt/homebrew/bin`, `/usr/local/bin` — so an install the launching shell never added to PATH is still found. |
 | `CEZ_CODEX_BIN=/path/to/codex` | Override which `codex` binary is used. |
@@ -527,7 +528,7 @@ platform.
 
 ## Talking to a running cockpit
 
-The cockpit is a local HTTP server; three CLIs, MCP clients (through `cez mcp`) and any script
+The cockpit is a local HTTP server; three CLIs, MCP clients (through `cez mcp`, or `/api/v1/mcp` with `CEZ_MCP` set) and any script
 can talk to it while it runs. They find it through `CEZ_API_URL` — the address the cockpit
 printed after `cockpit →` when it started (`http://127.0.0.1:4321` unless that
 port was busy or you passed `--port`).
@@ -647,7 +648,8 @@ lists the projects (id and name) to pass as `projectId`, or to name with
 `--project`. When the registry cannot be read (an error status, a timeout),
 nothing is remembered: reads fall back to the boot project for that call,
 `start_run` without a `projectId` refuses with the reason, and the next call
-reads the registry again. A run id
+reads the registry again. The cockpit's own endpoint ([`/api/v1/mcp`](#over-http-apiv1mcp))
+never has a working directory and applies the same rule. A run id
 is global: a read tool (`get_run`, `get_run_status`, `list_run_events`,
 `wait_for_runs`) given no `projectId` follows a run that lives in another
 project; `cancel_run` does not guess and names the project to pass instead. A
@@ -724,6 +726,78 @@ client's tool-result limit. `list_run_events` returns at most `maxEvents`
 `cursor`); without either — the newest events — read the older part it left out
 with `afterSeq: skippedAfterSeq`. `list_runs` counts rows past the budget in
 `more`, like rows past `limit`.
+
+### Over HTTP: `/api/v1/mcp`
+
+The same tools, served by the cockpit itself, so an agent connects with a URL and
+installs nothing. Off by default — start the cockpit with one of:
+
+| `CEZ_MCP` | `/api/v1/mcp` | `capabilities.mcp` in `/api/v1/health` |
+| --- | --- | --- |
+| unset, or any other value | does not exist (`404`) | `"off"` |
+| `read-only` | the nine read tools; `start_run` and `cancel_run` are not registered | `"read-only"` |
+| `1` | every tool | `"full"` |
+
+It is read at boot — restart after changing it. The endpoint is stateless and
+serves both protocol eras (the 2025 `initialize` handshake and 2026-07-28);
+`POST` carries every call, and `GET`/`DELETE` answer `405`, which clients take
+in their stride.
+
+**Claude Code** — `.mcp.json` (or `claude mcp add --transport http cezar http://127.0.0.1:4321/api/v1/mcp`):
+
+```json
+{ "mcpServers": { "cezar": { "type": "http", "url": "http://127.0.0.1:4321/api/v1/mcp" } } }
+```
+
+**Codex** — `~/.codex/config.toml`; the same timeouts and approvals as for
+`cez mcp` apply:
+
+```toml
+[mcp_servers.cezar]
+url = "http://127.0.0.1:4321/api/v1/mcp"
+tool_timeout_sec = 60
+```
+
+**OpenCode** — `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": { "cezar": { "type": "remote", "url": "http://127.0.0.1:4321/api/v1/mcp", "enabled": true } }
+}
+```
+
+**Which project.** Over HTTP there is no working directory to go by — the same
+case as `cez mcp` run where no registered project holds its directory, and the
+same rule. Tools that name no `projectId` read from the project the cockpit was
+started in, and `start_run` without a `projectId` works only when the cockpit
+serves that one project — otherwise it refuses and lists the projects (id and
+name) to choose from. There is no `--project` here: the agent passes
+`projectId`. Reads follow a run id into its own project exactly as `cez mcp`
+does.
+
+**Origin.** The request-origin guard checks `Origin` and `Sec-Fetch-Site` on
+every method of this path, not only on writes as elsewhere in the API: a browser
+page on another origin gets `403` even for a `GET`. MCP clients send no
+`Origin`, so they are unaffected.
+
+**Behind the `server-install` nginx.** It already does what the endpoint needs:
+`proxy_buffering off` (a call that sends progress streams as SSE, with a
+keepalive comment every 15 s) and `proxy_read_timeout 3600s` (a
+`wait_for_runs` call holds its POST for up to 45 s). A proxy of your own must do
+the same, or `wait_for_runs` turns into a proxy timeout. Set the flag in the
+service's environment: `systemctl edit cezar.service` (with `--user` or `sudo`,
+as in the `status` line the installer printed), add
+`Environment=CEZ_MCP=read-only` under `[Service]`, then restart the service.
+The login the proxy asks for is the client's to send: `headers` with an
+`Authorization: Basic …` value in Claude Code and OpenCode, `http_headers` in
+Codex.
+
+**Who can call it.** `/api/v1/mcp` adds no permission of its own: whoever can
+reach the cockpit's API can already start and cancel runs through REST, and with
+`CEZ_MCP=1` the same people can do it through these tools. Choose `read-only`
+when that is all an outside agent should do, and never expose a cockpit without
+the authenticated front described in [Remote access](#remote-access-host-cezar-on-a-server).
 
 ### The HTTP API
 
