@@ -89,6 +89,8 @@ const SETTLED = new Set(['done', 'failed', 'cancelled', 'waiting', 'review']);
 export const WAIT_MAX_SECONDS = 45;
 export const WAIT_DEFAULT_SECONDS = 40;
 export const WAIT_POLL_MS = 2_000;
+/** review_run send_back waits for its continuation to start for at most this many reads, `WAIT_POLL_MS / 8` apart (~5 s). */
+const SEND_BACK_POLLS = 20;
 /** `GET /models` may ask a vendor CLI first, bounded at 15 s server-side — past the 10 s default. */
 const MODELS_TIMEOUT_MS = 30_000;
 /** Without `afterSeq` on `/history`, catching up walks back at most this many pages (100 items each). */
@@ -750,6 +752,21 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
   const runForWrite = (c: Cockpit, projectId: string | undefined, runId: string) =>
     inRunProject(c, projectId, runId, async (pid) => ({ pid, run: await readRun(c, pid, runId) }), { follow: false });
   const statusNow = async (c: Cockpit, pid: string, runId: string) => (await readRun(c, pid, runId).catch(() => undefined))?.status;
+  /** `/continue` starts the session asynchronously, so the record reads `review` for a moment
+   *  after it answers — and a `wait_for_runs` then would return that stale `review` at once. Wait,
+   *  bounded, until the send-back's step has started; its status is then the honest answer. */
+  const sentBackStatus = async (c: Cockpit, pid: string, runId: string) => {
+    let status: string | undefined;
+    for (let i = 0; i < SEND_BACK_POLLS; i += 1) {
+      const run = await readRun(c, pid, runId).catch(() => undefined);
+      if (!run) return status;
+      status = run.status;
+      const step = [...run.steps].reverse().find((s) => s.id.startsWith('continue-'));
+      if (status !== 'review' || (step && step.status !== 'pending')) return status;
+      await sleep(pollMs / 8);
+    }
+    return status;
+  };
 
   server.registerTool(
     'push_run_branch',
@@ -829,7 +846,8 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
         '"accept" (✓ Accept, POST /runs/:id/finish) only marks the run done: nothing is merged, committed, pushed or opened as a PR, ' +
         'and the worktree and branch stay as they are — publish with push_run_branch. ' +
         '"send_back" (↩ Send back, POST /runs/:id/continue) sends notes into the agent\'s session prefixed "Review feedback:"; ' +
-        'the agent works on them (costs agent usage) and parks again at waiting or review. ' +
+        'the agent works on them (costs agent usage) and parks again at waiting or review; the answer comes once the agent ' +
+        'has picked them up (at most ~5 s). ' +
         'Any status other than "review" is an error.',
       inputSchema: runArgs.extend({
         decision: z.enum(['accept', 'send_back']).describe('"accept" or "send_back".'),
@@ -850,11 +868,19 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
         if (run.status !== 'review') throw new Error(`run ${runId} is ${run.status}, not review — review_run only decides at the review gate`);
         const param = { projectId: pid, id: runId };
         const route = c.api.api.v1.p[':projectId'].runs[':id'];
+        // Both routes refuse (409, nothing changed) while the engine still holds a run that reads
+        // `review` — a send-back that has not started yet, or one still settling.
+        const busy = (error: unknown) => {
+          if (!(error instanceof CezarApiError) || error.status !== 409) throw error;
+          throw new Error(`${describeError(error)} — the run is still being resumed or settled; wait_for_runs, then decide again`);
+        };
         const answer =
           decision === 'accept'
-            ? finishResponseSchema.parse(await readJson(await route.finish.$post({ param })))
-            : continueResponseSchema.parse(await readJson(await route.continue.$post({ param, json: { text: `${REVIEW_FEEDBACK_PREFIX}${feedback}` } })));
-        const status = await statusNow(c, pid, runId);
+            ? finishResponseSchema.parse(await readJson(await route.finish.$post({ param })).catch(busy))
+            : continueResponseSchema.parse(
+                await readJson(await route.continue.$post({ param, json: { text: `${REVIEW_FEEDBACK_PREFIX}${feedback}` } })).catch(busy),
+              );
+        const status = decision === 'accept' ? await statusNow(c, pid, runId) : await sentBackStatus(c, pid, runId);
         return reviewOutput.parse({ ...answer, projectId: pid, runId, decision, ...(status ? { status } : {}) });
       }),
   );

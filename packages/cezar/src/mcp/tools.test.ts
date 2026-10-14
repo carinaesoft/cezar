@@ -774,13 +774,46 @@ describe('cez mcp tools: push_run_branch, send_run_message, review_run', () => {
       expect(calls).toEqual([]);
     });
 
-    it("relays the route's refusal (a provider that cannot continue)", async () => {
+    it.each([
+      ['accept', 'finish', 'no open session'],
+      ['send_back', 'continue', 'run is still active'],
+    ])("%s relays the route's 409 and says the run may still be settling", async (decision, route, reason) => {
       const mcp = await connect({
         [`GET ${R}`]: { body: run('r1', 'review') },
-        [`POST ${R}/continue`]: { status: 409, body: { error: 'no agent session to resume' } },
+        [`POST ${R}/${route}`]: { status: 409, body: { error: reason } },
+      });
+      const result = await mcp.callTool({ name: 'review_run', arguments: { runId: 'r1', decision, ...(decision === 'send_back' ? { notes: 'x' } : {}) } });
+      expect(textOf(result)).toBe(`cezar refused: 409: ${reason} — the run is still being resumed or settled; wait_for_runs, then decide again`);
+    });
+
+    it('send_back answers once its continuation has started, not with the stale review', async () => {
+      // /continue starts the session asynchronously: the record reads review, its step pending, for a moment.
+      const states = [
+        run('r1', 'review', { steps: [{ id: 'task', status: 'done' }] }),
+        run('r1', 'review', { steps: [{ id: 'task', status: 'done' }, { id: 'continue-1', status: 'pending' }] }),
+        run('r1', 'review', { steps: [{ id: 'task', status: 'done' }, { id: 'continue-1', status: 'pending' }] }),
+        run('r1', 'running', { steps: [{ id: 'task', status: 'done' }, { id: 'continue-1', status: 'running' }] }),
+      ];
+      let reads = 0;
+      const mcp = await connect({
+        [`GET ${R}`]: () => ({ body: states[Math.min((reads += 1) - 1, states.length - 1)] }),
+        [`POST ${R}/continue`]: { body: { continued: true } },
       });
       const result = await mcp.callTool({ name: 'review_run', arguments: { runId: 'r1', decision: 'send_back', notes: 'x' } });
-      expect(textOf(result)).toBe('cezar refused: 409: no agent session to resume');
+      expect((result.structuredContent as { status: string }).status).toBe('running');
+      expect(reads).toBe(4);
+    });
+
+    it('send_back that already re-parked at review says review, without waiting it out', async () => {
+      const parked = run('r1', 'review', { steps: [{ id: 'task', status: 'done' }, { id: 'continue-1', status: 'done' }] });
+      let reads = 0;
+      const mcp = await connect({
+        [`GET ${R}`]: () => ({ body: (reads += 1) === 1 ? run('r1', 'review') : parked }),
+        [`POST ${R}/continue`]: { body: { continued: true } },
+      });
+      const result = await mcp.callTool({ name: 'review_run', arguments: { runId: 'r1', decision: 'send_back', notes: 'x' } });
+      expect((result.structuredContent as { status: string }).status).toBe('review');
+      expect(reads).toBe(2);
     });
   });
 
