@@ -50,6 +50,20 @@ export interface Cockpit {
   /** Set when discovery could not rule out another cockpit (a port that stalled): why. Every
    *  write refuses with this; reads go ahead. */
   writeRefused?: string;
+  /** What this answer was made without (a stalled port, an unread registry), shown with every
+   *  answer so the model sees it, not just stderr. */
+  warnings?: string[];
+}
+
+export interface ProjectChoice {
+  id: string;
+  name?: string;
+}
+
+/** `"2 projects (a (Repo A), b)"` — what start_run asks the model to choose from. */
+export function describeProjectChoice(projects: ProjectChoice[]): string {
+  const listed = projects.map((p) => (p.name && p.name !== p.id ? `${p.id} (${p.name})` : p.id)).join(', ');
+  return `${projects.length} project${projects.length === 1 ? '' : 's'} (${listed || 'none registered'})`;
 }
 
 export interface McpToolsOptions {
@@ -101,7 +115,13 @@ export const startRunInputSchema = createRunInputBaseSchema
 
 // ---- outputs ---------------------------------------------------------------------------------
 
+const warningsField = z
+  .array(z.string())
+  .optional()
+  .describe('What this answer was made without (e.g. a cockpit port that did not answer) — it may come from the wrong cockpit.');
+
 const projectsOutput = projectsResponseSchema.pick({ bootProject: true }).extend({
+  warnings: warningsField,
   projects: z.array(projectListEntrySchema.pick({ id: true, name: true, root: true, status: true, branch: true })),
 });
 
@@ -112,6 +132,7 @@ const workflowsOutput = z.object({
       .extend({ steps: z.array(z.string()).describe('Step names, in order.') }),
   ),
   issues: z.array(workflowLoadIssueSchema).optional(),
+  warnings: warningsField,
 });
 
 const runRowOutput = runIndexEntrySchema
@@ -121,6 +142,7 @@ const runsOutput = runsIndexResponseSchema.pick({ truncated: true }).extend({
   runs: z.array(runRowOutput),
   total: z.number().int(),
   more: z.number().int().optional(),
+  warnings: warningsField,
 });
 
 /** What an orchestrating agent needs to decide its next step, without the transcript. */
@@ -146,13 +168,14 @@ const runStatusOutput = apiRunSchema
     projectId: z.string().describe('The project the run belongs to — pass it as projectId to address the run.'),
     status: z.string(),
     activity: z.string().optional(),
+    warnings: warningsField,
   });
 type RunStatusOutput = z.infer<typeof runStatusOutput>;
 
 /** The whole record, long strings clipped; loose because the record grows with every release. */
 const runOutput = apiRunSchema
   .pick({ id: true, title: true, workflow: true, task: true, createdAt: true })
-  .extend({ projectId: z.string(), status: z.string() })
+  .extend({ projectId: z.string(), status: z.string(), warnings: warningsField })
   .loose();
 
 const eventsOutput = runHistoryPageSchema.pick({ asOfSeq: true, olderCursor: true, newerCursor: true }).extend({
@@ -172,11 +195,13 @@ const eventsOutput = runHistoryPageSchema.pick({ asOfSeq: true, olderCursor: tru
     .int()
     .optional()
     .describe('Older events of the newest page were left out: call with afterSeq set to this to read them.'),
+  warnings: warningsField,
 });
 
 const waitOutput = z.object({
   runs: z.array(runStatusOutput.partial().extend({ id: z.string(), status: z.string() })),
   timedOut: z.boolean().describe('true: nothing settled in time — call wait_for_runs again.'),
+  warnings: warningsField,
 });
 
 /** `/github/ref-status` answers a union; an MCP output schema must be one object, so it is the
@@ -184,15 +209,23 @@ const waitOutput = z.object({
 const [refStatusAvailable] = githubRefStatusDataSchema.options;
 const prStatusOutput = refStatusAvailable
   .partial({ prs: true, issues: true })
-  .extend({ available: z.boolean(), reason: z.string().optional() });
+  .extend({ available: z.boolean(), reason: z.string().optional(), warnings: warningsField });
+
+const modelsOutput = runnerModelCatalogResponseSchema.extend({ warnings: warningsField });
 
 // ---- plumbing --------------------------------------------------------------------------------
 
 const READ: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 
-function ok(data: Record<string, unknown>): CallToolResult {
-  const fitted = fitToBudget(data);
-  return { content: [{ type: 'text', text: JSON.stringify(fitted) }], structuredContent: fitted };
+function ok(data: Record<string, unknown>, warnings?: string[]): CallToolResult {
+  const fitted = fitToBudget(warnings?.length ? { ...data, warnings } : data);
+  return {
+    content: [
+      { type: 'text', text: JSON.stringify(fitted) },
+      ...(warnings?.length ? [{ type: 'text' as const, text: `warning: ${warnings.join('; ')}` }] : []),
+    ],
+    structuredContent: fitted,
+  };
 }
 
 const sizeOf = (value: unknown) => JSON.stringify(value).length;
@@ -274,12 +307,16 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
     fn: (c: Cockpit) => Promise<Record<string, unknown>>,
     { retry }: { retry: boolean },
   ): Promise<CallToolResult> => {
+    const attempt = async () => {
+      const c = await options.cockpit();
+      return ok(await fn(c), c.warnings);
+    };
     try {
-      return ok(await fn(await options.cockpit()));
+      return await attempt();
     } catch (error) {
       if (retry && isConnectionError(error)) {
         try {
-          return ok(await fn(await options.cockpit()));
+          return await attempt();
         } catch (again) {
           return fail(describeError(again));
         }
@@ -330,7 +367,7 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       title: 'List models',
       description: 'Models the given agent runner can use on this host (start_run.model).',
       inputSchema: z.object({ runner: modelDiscoveryRunnerSchema.describe('Agent runner.') }),
-      outputSchema: runnerModelCatalogResponseSchema,
+      outputSchema: modelsOutput,
       // Discovery asks the vendor's own CLI, which may ask the vendor.
       annotations: { ...READ, openWorldHint: true },
     },
