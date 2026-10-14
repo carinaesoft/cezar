@@ -123,7 +123,9 @@ describe('CreateProjectDialog', () => {
     expect(posted[0]).toMatchObject({ name: 'fresh', github: { owner: 'acme' } })
     expect(JSON.stringify(posted[0])).not.toMatch(/visib|public/i)
     await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false))
-    expect(document.querySelector('[data-testid="location"]')?.textContent).toBe('/p/fresh/')
+    // React Router commits navigate() in a transition, after the close: wait for it, never read it
+    // synchronously (it lost that race 4 runs in 5 under CPU load).
+    await waitFor(() => expect(document.querySelector('[data-testid="location"]')?.textContent).toBe('/p/fresh/'))
   })
 
   it('puts the owner cards in their own column beside the form, and drops it without GitHub', async () => {
