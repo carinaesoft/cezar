@@ -18,7 +18,7 @@ import {
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 const health = (repoRoot = 'x') => json({ version: '0.15.0', capabilities: {}, repoRoot });
 
-type Project = { id: string; root: string };
+type Project = { id: string; root: string; name?: string; status?: string };
 
 /**
  * A fetch answering like cockpits on the given ports. Like real cockpits on one machine they share
@@ -51,7 +51,11 @@ const REGISTRY: Project[] = [
 describe('cockpit discovery', () => {
   it('probes 4321–4370 and takes the only cockpit, whatever it serves', async () => {
     const probed: string[] = [];
-    expect(await discoverCockpit(cockpits([{ id: 'a', root: '/work/a' }], { 4330: 'a' }, probed), '/elsewhere')).toEqual({ url: 'http://127.0.0.1:4330', bootProject: 'a' });
+    expect(await discoverCockpit(cockpits([{ id: 'a', root: '/work/a' }], { 4330: 'a' }, probed), '/elsewhere')).toEqual({
+      url: 'http://127.0.0.1:4330',
+      bootProject: 'a',
+      projects: [{ id: 'a' }],
+    });
     expect(probed).toContain('http://127.0.0.1:4321/api/v1/health');
     expect(probed).toContain('http://127.0.0.1:4370/api/v1/health');
     expect(probed).not.toContain('http://127.0.0.1:4371/api/v1/health');
@@ -94,7 +98,7 @@ describe('cockpit discovery', () => {
       if (url.pathname === '/api/v1/health') return health(url.port === '4322' ? '/work/wt' : '/work/other');
       return json({ bootProject: url.port === '4322' ? 'wt' : 'other', projectsDir: '/', projects: [{ id: 'other', root: '/work/other' }] });
     };
-    expect(await discoverCockpit(fetchImpl, '/work/wt/src')).toEqual({ url: 'http://127.0.0.1:4322', bootProject: 'wt' });
+    expect(await discoverCockpit(fetchImpl, '/work/wt/src')).toEqual({ url: 'http://127.0.0.1:4322', bootProject: 'wt', projects: [{ id: 'other' }] });
   });
 
   it('ignores a port that answers but is not a cockpit', async () => {
@@ -104,7 +108,7 @@ describe('cockpit discovery', () => {
       if (url.port === '4325') return url.pathname.endsWith('/health') ? health() : json({ projects: [] });
       throw new TypeError('fetch failed');
     };
-    expect(await discoverCockpit(fetchImpl, '/')).toEqual({ url: 'http://127.0.0.1:4325' });
+    expect(await discoverCockpit(fetchImpl, '/')).toEqual({ url: 'http://127.0.0.1:4325', projects: [] });
   });
 
   it('a port that is slow on the first probe gets a second, longer one — and nothing waits when all answer', async () => {
@@ -189,10 +193,31 @@ describe('cockpit resolver', () => {
     const resolve = createCockpitResolver({ fetch: fetchImpl, cwd: '/work/mono/packages/pkg', explicitUrl: 'http://127.0.0.1:4999' });
     expect((await resolve()).defaultProjectId).toBe('pkg');
     expect(probed).toEqual(['http://127.0.0.1:4999/api/v1/projects']);
-    // no project holds the cwd: the boot project, by its id
+    // no project holds the cwd: reads use the boot project, by its id
     const outside = createCockpitResolver({ fetch: fetchImpl, cwd: '/tmp/elsewhere', explicitUrl: 'http://127.0.0.1:4999' });
     expect(await outside()).toMatchObject({ defaultProjectId: 'other' });
-    expect((await outside()).projectUnknown).toBeUndefined();
+  });
+
+  it('no project holds the cwd: start_run must be told which, unless the cockpit serves one project', async () => {
+    // QA of #1109: `--url` from another machine sent every start_run to the boot project.
+    const named = REGISTRY.map((p) => ({ ...p, name: p.id === 'mono' ? 'Mono Repo' : p.id }));
+    const outside = createCockpitResolver({ fetch: cockpits(named, { 4999: 'other' }), cwd: '/Users/me/code', explicitUrl: 'http://127.0.0.1:4999' });
+    const many = await outside();
+    expect(many.defaultProjectId).toBe('other');
+    expect(many.projectUnknown).toBe(
+      'no project of http://127.0.0.1:4999 holds /Users/me/code, and it serves 3 projects (other, mono (Mono Repo), pkg) — pass projectId to say which one the run belongs to, or start cez mcp with --project <id> (or CEZ_PROJECT_ID)',
+    );
+    // so does a discovered cockpit
+    const discovered = createCockpitResolver({ fetch: cockpits(named, { 4321: 'other' }), cwd: '/Users/me/code' });
+    expect((await discovered()).projectUnknown).toMatch(/^no project of http:\/\/127\.0\.0\.1:4321 holds/);
+    // one project, the one it booted in: nothing to choose
+    const single = createCockpitResolver({ fetch: cockpits([{ id: 'a', root: '/srv/a' }], { 4999: 'a' }), cwd: '/Users/me', explicitUrl: 'http://127.0.0.1:4999' });
+    expect(await single()).toMatchObject({ defaultProjectId: 'a' });
+    expect((await single()).projectUnknown).toBeUndefined();
+    // --project / CEZ_PROJECT_ID says which
+    const told = createCockpitResolver({ fetch: cockpits(named, { 4999: 'other' }), cwd: '/Users/me', explicitUrl: 'http://127.0.0.1:4999', projectId: 'pkg' });
+    expect(await told()).toMatchObject({ defaultProjectId: 'pkg' });
+    expect((await told()).projectUnknown).toBeUndefined();
   });
 
   it('an unreadable registry is not kept, and leaves the project unknown instead of guessing the boot project', async () => {
@@ -400,6 +425,11 @@ describe('cez mcp flags', () => {
     expect(writes).toEqual([]);
     const listed = await client.callTool({ name: 'list_projects', arguments: {} });
     expect(listed.isError, text(listed)).toBeFalsy();
+    // the read says so itself, not only on stderr
+    expect((listed.structuredContent as { warnings?: string[] }).warnings).toEqual([
+      expect.stringMatching(/127\.0\.0\.1:4345 accepted a connection but did not answer.*answered from http:\/\/127\.0\.0\.1:4343/),
+    ]);
+    expect((listed.content as Array<{ text: string }>)[1]!.text).toMatch(/^warning: 127\.0\.0\.1:4345 accepted a connection/);
     expect(h.err.some((l) => /4345 accepted a connection.*this call only/.test(l))).toBe(true);
 
     stalled = false;
@@ -407,6 +437,56 @@ describe('cez mcp flags', () => {
     await client.close();
     expect(writes).toEqual(['POST http://127.0.0.1:4345/api/v1/p/repob/runs']);
   }, 60_000);
+
+  it('--url from another machine: start_run without projectId lists the projects instead of using the boot one', async () => {
+    const writes: string[] = [];
+    const base = cockpits(
+      [
+        { id: 'code', root: '/srv/code', name: 'code', status: 'ok' },
+        { id: 'shop', root: '/srv/shop', name: 'Shop', status: 'ok' },
+      ],
+      { 4321: 'code' },
+    );
+    const fetchImpl: CezarFetchLike = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const method = input instanceof Request ? input.method : (init?.method ?? 'GET');
+      if (method !== 'GET') {
+        writes.push(`${method} ${url.pathname}`);
+        return json({ id: 'r1', title: 't', workflow: 'quick-task', status: 'queued', createdAt: '2026-10-14T00:00:00Z' }, 201);
+      }
+      return base(input);
+    };
+    const session = async (args: string[], env = {}) => {
+      const h = io({ cwd: '/Users/me/code', fetch: fetchImpl });
+      await runMcpCommand(['--url', 'http://127.0.0.1:4321', ...args], env, h.harness);
+      const server = await h.factories[0]!({ era: 'legacy' } as Parameters<McpServerFactory>[0]);
+      const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverSide);
+      const client = new Client({ name: 't', version: '0' });
+      await client.connect(clientSide);
+      return client;
+    };
+    const text = (r: Awaited<ReturnType<Client['callTool']>>) => (r.content as Array<{ text: string }>)[0]!.text;
+
+    const plain = await session([]);
+    const refused = await plain.callTool({ name: 'start_run', arguments: { workflow: 'quick-task', task: 'x' } });
+    expect(refused.isError).toBe(true);
+    expect(text(refused)).toMatch(/serves 2 projects \(code, shop \(Shop\)\) — pass projectId/);
+    expect(writes).toEqual([]);
+    // reads are unchanged: the boot project
+    expect((await plain.callTool({ name: 'list_projects', arguments: {} })).isError).toBeFalsy();
+    const chosen = await plain.callTool({ name: 'start_run', arguments: { workflow: 'quick-task', task: 'x', projectId: 'shop' } });
+    expect(chosen.isError, text(chosen)).toBeFalsy();
+    await plain.close();
+
+    for (const [args, env] of [[['--project', 'shop'], {}], [[], { CEZ_PROJECT_ID: 'shop' }]] as const) {
+      const client = await session([...args], env);
+      const started = await client.callTool({ name: 'start_run', arguments: { workflow: 'quick-task', task: 'x' } });
+      expect(started.isError, text(started)).toBeFalsy();
+      await client.close();
+    }
+    expect(writes).toEqual(['POST /api/v1/p/shop/runs', 'POST /api/v1/p/shop/runs', 'POST /api/v1/p/shop/runs']);
+  });
 });
 
 /** A client-side newline-delimited JSON-RPC transport over a pair of streams — the shape of a

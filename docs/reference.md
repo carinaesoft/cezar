@@ -628,8 +628,9 @@ there, or two were started in the same place, the tools say so and ask for
 a readable tool error — and a cockpit restarted on another port is found again
 on the next call. A port that accepts the connection but misses the 800 ms probe
 is asked once more with 3 s; if it still says nothing, the choice is made without
-it, `cez mcp` names that port on stderr, and the answer is used for that call only
-— the next call looks again. That silent port may be the cockpit the working
+it, `cez mcp` names that port on stderr and in the answer itself (`warnings` in
+`structuredContent`, plus one `warning:` line of text), and the answer is used
+for that call only — the next call looks again. That silent port may be the cockpit the working
 directory belongs to, so only reads go ahead without it: `start_run` and
 `cancel_run` send nothing and fail naming the port, asking for `--url` (or
 `CEZ_API_URL`), and work again once that port answers. Inside a cezar task an absent `CEZ_API_URL` still means the
@@ -638,10 +639,15 @@ cockpit withheld it, so `cez mcp` does not probe there.
 **Which project.** However the cockpit was found — `--url` and `CEZ_API_URL`
 included — tools that name no `projectId` target `--project` (else
 `CEZ_PROJECT_ID`), else the project in that cockpit's registry holding the
-working directory, else the cockpit's boot project. When the registry cannot be
-read (an error status, a timeout), nothing is remembered: reads fall back to the
-boot project for that call, `start_run` without a `projectId` refuses with the
-reason instead of guessing, and the next call reads the registry again. A run id
+working directory. When no project holds it — a cockpit on another machine,
+whose paths your working directory never matches, or an agent started outside
+every registered repo — reads use the cockpit's boot project, but `start_run`
+does not guess: unless the cockpit serves that one project, it refuses and
+lists the projects (id and name) to pass as `projectId`, or to name with
+`--project`. When the registry cannot be read (an error status, a timeout),
+nothing is remembered: reads fall back to the boot project for that call,
+`start_run` without a `projectId` refuses with the reason, and the next call
+reads the registry again. A run id
 is global: a read tool (`get_run`, `get_run_status`, `list_run_events`,
 `wait_for_runs`) given no `projectId` follows a run that lives in another
 project; `cancel_run` does not guess and names the project to pass instead. A
@@ -649,11 +655,29 @@ run no project has is reported as such. `start_run`, `get_run`,
 `get_run_status` and `wait_for_runs` answer with the run's `projectId`.
 
 **Flags.** `--project <id>` sets the project tools target when a call names
-none (else `CEZ_PROJECT_ID`, else the project holding the working directory,
-else the cockpit's own). `--read-only` registers only the read tools —
+none (else `CEZ_PROJECT_ID`, else the project holding the working directory;
+reads then fall back to the cockpit's own). `--read-only` registers only the read tools —
 `start_run` and `cancel_run` do not exist for that client, they are not just
 marked. `--header "Name: value"` (repeatable) adds a header for a cockpit behind
 a proxy (Basic auth, Cloudflare Access).
+
+**A cockpit on another machine.** From a laptop to a cockpit on the LAN (or
+behind a proxy, with `--header`), name the address — nothing is probed then —
+and, for writes, the project. Read-only, safe to leave on:
+
+```bash
+claude mcp add cezar-ro -- npx -y cezar-run mcp --url http://192.168.1.20:4321 --read-only
+```
+
+Full access, with runs started in one project unless a call names another:
+
+```bash
+claude mcp add cezar -- npx -y cezar-run mcp --url http://192.168.1.20:4321 --project my-app
+```
+
+Without `--project`, the agent calls `list_projects` and passes `projectId` to
+`start_run`; the refusal above tells it to. `claude mcp add --scope user` makes
+the entry available in every directory.
 
 **Tools.** Names are snake_case, arguments camelCase as in the API contract.
 Every tool declares `readOnlyHint`, `destructiveHint`, `idempotentHint` and
