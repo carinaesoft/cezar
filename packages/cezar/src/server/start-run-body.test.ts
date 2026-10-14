@@ -14,7 +14,7 @@ import { connectedProviderAuth } from './provider-auth.testkit.ts';
 /**
  * `POST /runs` body validation, pinned input by input (#1109 point 4). The route validates the
  * contract's `createRunInputSchema`; these answers were recorded against the route's former local
- * `startRunSchema` and must not move — status, error text, and what reaches the manager.
+ * `startRunSchema` and must not move: status, error text, and what reaches the manager.
  */
 describe('POST /api/v1/runs body validation', () => {
   let repoRoot: string;
