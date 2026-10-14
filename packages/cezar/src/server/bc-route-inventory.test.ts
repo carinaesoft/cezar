@@ -129,6 +129,21 @@ describe('BACKWARD_COMPATIBILITY.md §2 route inventory', () => {
     ).toEqual([]);
   });
 
+  it('lists the opt-in routes too — /api/v1/mcp exists only with CEZ_MCP set (#1109)', () => {
+    const saved = process.env.CEZ_MCP;
+    process.env.CEZ_MCP = '1';
+    try {
+      const withMcp = createApp({ repoRoot, store: RunStore.open(join(repoRoot, '.ai/cezar')), manager: {} as RunManager, version: '0.0.0-test' });
+      const registered = registeredApiRoutes(withMcp.routes);
+      expect(registered).toContain('/api/v1/mcp');
+      const inventoried = inventoriedApiRoutes(doc);
+      expect([...registered].filter((r) => !inventoried.has(r)).sort()).toEqual([]);
+    } finally {
+      if (saved === undefined) delete process.env.CEZ_MCP;
+      else process.env.CEZ_MCP = saved;
+    }
+  });
+
   it('finds a non-trivial number of routes on both sides — guards against a vacuous pass', () => {
     // Without this, a reader that silently stopped seeing routes would make the guard above
     // pass by comparing two empty sets, which is exactly the failure mode a drift guard must

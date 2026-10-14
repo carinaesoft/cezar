@@ -49,6 +49,7 @@
  */
 
 import { followupsEnabled } from '../handoff.ts';
+import { mcpMode } from '../mcp/mode.ts';
 import type { Capabilities } from '@open-mercato/cezar-contract';
 
 /** Every IPv4 address in 127.0.0.0/8, anchored. Anchoring is load-bearing: a
@@ -142,6 +143,8 @@ export function isLoopbackHostHeader(host: string | null | undefined): boolean {
  *  `CEZ_FOLLOWUPS=1` ⇒ the follow-up inbox exists (#471).
  *  `CEZ_AUTOMATIONS=1` ⇒ GitHub automations exist (#801).
  *  `CEZ_DISPATCH=0` ⇒ task dispatch is OFF (spec 2026-09-10-dispatch); on otherwise.
+ *  `CEZ_MCP=1|read-only` ⇒ `/api/v1/mcp` is served (#1109); the server overrides this with the
+ *  mode it mounted at boot, since the route is never mounted later.
  *
  *  Read per request — cheap, and tests/ops can flip `CEZ_REMOTE` live. `followups` is honest
  *  per request too, but flipping it ON at runtime is only half a switch: the per-dataDir
@@ -168,6 +171,7 @@ export function resolveCapabilities(env: NodeJS.ProcessEnv = process.env, bindHo
     singleProject: env.CEZ_SINGLE_PROJECT === '1',
     automations: env.CEZ_AUTOMATIONS !== '0',
     dispatch: env.CEZ_DISPATCH !== '0',
+    mcp: mcpMode(env),
     tokenMetrics: tokenUsageMetrics && costMetrics,
     tokenUsageMetrics,
     costMetrics,

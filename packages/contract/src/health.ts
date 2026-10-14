@@ -56,6 +56,12 @@ export const capabilitiesSchema = z.object({
    */
   dispatch: z.boolean(),
   /**
+   * Whether this server answers the MCP endpoint `/api/v1/mcp` (#1109): `off` — the default, the
+   * route does not exist — `read-only` (`CEZ_MCP=read-only`, no write tools registered) or `full`
+   * (`CEZ_MCP=1`). Fixed at boot.
+   */
+  mcp: z.enum(['off', 'read-only', 'full']),
+  /**
    * `false` means `CEZ_HIDE_TOKEN_METRICS=1` asks the browser to omit token counts and monetary
    * cost (#481). The telemetry itself still rides in run/event payloads — this is presentation
    * only.
