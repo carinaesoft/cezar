@@ -1,4 +1,4 @@
-import type { InferResponseType } from 'hono/client';
+import type { InferRequestType, InferResponseType } from 'hono/client';
 import { hc } from 'hono/client';
 import { describe, expect, it } from 'vitest';
 import type { z } from 'zod';
@@ -8,6 +8,7 @@ import type {
   cancelResponseSchema,
   continueResponseSchema,
   createPrResponseSchema,
+  createRunInputSchema,
   createRunResponseSchema,
   deleteRunResponseSchema,
   editQueuedMessageResponseSchema,
@@ -52,6 +53,7 @@ describe('src/contract/runs.ts matches the runs routes exactly', () => {
   type RunsList200 = InferResponseType<Runs['$get'], 200>;
   type RunGet200 = InferResponseType<Run['$get'], 200>;
   type RunCreate201 = InferResponseType<Runs['$post'], 201>;
+  type RunCreateBody = InferRequestType<Runs['$post']>['json'];
   type RunArchive200 = InferResponseType<Run['archive']['$post'], 200>;
   type RunPin200 = InferResponseType<Run['pin']['$post'], 200>;
   type RunRead200 = InferResponseType<Run['read']['$post'], 200>;
@@ -94,6 +96,9 @@ describe('src/contract/runs.ts matches the runs routes exactly', () => {
         | { runs: Extract<RunCreate201, { runs: unknown }>['runs'][number][] }
       >
     >,
+    // ...and its body is the contract's own (#1109): `z.input`, because what a caller may send is
+    // the input side, which differs from the output wherever a field transforms (`systemPrompt`)
+    Assert<Exact<z.input<typeof createRunInputSchema>, RunCreateBody>>,
     // lifecycle
     Assert<Exact<z.infer<typeof archiveFinishedResponseSchema>, ArchiveFinished200>>,
     Assert<Exact<z.infer<typeof cancelResponseSchema>, Cancel200>>,

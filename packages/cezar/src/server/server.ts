@@ -64,6 +64,7 @@ import {
 // schema this route validates with is the same one the client compiles against.
 import {
   attachmentInputSchema,
+  createRunInputSchema,
   modelDiscoveryRunnerSchema,
   openProjectInSchema,
   updateProjectInputSchema,
@@ -667,72 +668,12 @@ const streamSSENoBuffer: typeof streamSSE = (c, cb, onError) => {
   return res;
 };
 
-// A run starts from a named workflow OR an inline chain of steps (spec 008 —
-// the approved plan is posted as-is, never written to a file).
-const startRunSchema = z
-  .object({
-    workflow: z.string().min(1).optional(),
-    steps: z.array(workflowStepSchema).min(1).max(8).optional(),
-    // The primary agent prompt handed to the spawned runner. Bounded like the
-    // other prompt fields (`systemPrompt` 20k, message `text` 100k) so an
-    // unbounded body can't be piped into a spawned process (#429). 100k chars
-    // (~25k tokens) is well past any hand-written task.
-    task: z.string().min(1).max(100_000, 'must be at most 100000 characters'),
-    model: z.string().optional(),
-    // Agent backend for this task (falls back to config `defaultRunner`).
-    runner: z.enum(RUNNER_IDS).optional(),
-    // Agent account for this task (spec 2026-07-29-agent-profiles). Falls back to the project's
-    // own selection, then the discovered default. Bounded like a profile id in the workspace
-    // schema, so a value this route accepts can never be degraded away by the next load.
-    agentProfile: z.string().max(64).optional(),
-    // Parallel variants (spec 010): ×2/×3 runs the task as 2–3 competing
-    // agents in separate worktrees; the user compares diffs and picks one.
-    variants: z.number().int().min(1).max(3).optional(),
-    // Composer worktree opt-out (#worktree-toggle): false runs in the repo
-    // working tree. Ignored when variants > 1.
-    worktree: z.boolean().optional(),
-    // Autonomous mode (#autonomous): the run never parks at `waiting` — it
-    // auto-continues until the agent signals done. No "needs you" is raised.
-    autonomous: z.boolean().optional(),
-    // Generate follow-up inbox entries (spec 007, #444). Honoured only while
-    // the `followups` capability is on (#471) — off, the server pins it to
-    // false whatever the client asked for. Omitted still means "enabled" for
-    // old clients, but only within an already-enabled server. The handoff
-    // journal is unaffected either way.
-    generateFollowups: z.boolean().optional(),
-    // Per-run system-prompt override (R2 2.3) — programmatic callers only
-    // (bookmarklets, scripts); deliberately NOT a composer-UI control. Wins
-    // over the config.json default; whitespace-only degrades to absent.
-    systemPrompt: z
-      .string()
-      .trim()
-      .max(20_000, 'must be at most 20000 characters')
-      .optional()
-      .transform((s) => (s ? s : undefined)),
-    // Attachments pasted into the new-task form — same shape and limits as a
-    // live-session message; delivered with the first agent step's opening.
-    images: z.array(attachmentInputSchema).max(4).optional(),
-    // Inbox follow-up (#374): the todo the composer was prefilled from
-    // (`/new?skill=&ref=&todo=t1`). On a successful start the entry is marked
-    // started — the same bookkeeping POST /api/todos/:id/start does, so the
-    // audit trail survives the composer detour. Bounded like every other
-    // string here; a todo id is a short generated key.
-    todoId: z.string().min(1).max(200, 'must be at most 200 characters').optional(),
-    // The composer's Dispatch toggle (spec 2026-09-10-dispatch): this task is the root of a
-    // dispatch tree, within the user's limits. Dropped — not refused — when the capability is
-    // off: the task itself is still perfectly valid as an ordinary run.
-    dispatch: dispatchIntentSchema.optional(),
-  })
-  .refine((b) => Boolean(b.workflow) !== Boolean(b.steps), {
-    message: 'provide either "workflow" or "steps", not both',
-  });
-
 const pickSchema = z.object({
   runId: z.string().min(1),
 });
 
 const planSchema = z.object({
-  // Same bound as `startRunSchema.task` — this flows into `planChain` (#429).
+  // Same bound as `createRunInputSchema.task` — this flows into `planChain` (#429).
   task: z.string().trim().min(1).max(100_000, 'must be at most 100000 characters'),
 });
 
@@ -4340,7 +4281,9 @@ export function createApp(deps: ServerDeps) {
       return run ? c.json(run) : c.json({ error: 'not found' }, 404);
     })
 
-    .post('/runs', jsonZodValidator(startRunSchema), async (c) => {
+    // A run starts from a named workflow OR an inline chain (spec 008). One body schema, the
+    // contract's own (#1109): `start-run-body.test.ts` pins every answer it gives.
+    .post('/runs', jsonZodValidator(createRunInputSchema), async (c) => {
       const { root: repoRoot, dataDir, manager } = c.get('project');
       const parsed = { data: c.req.valid('json') };
       if (agentModelsLocked(repoRoot) && parsed.data.model?.trim()) {
