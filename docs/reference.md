@@ -648,7 +648,8 @@ lists the projects (id and name) to pass as `projectId`, or to name with
 `--project`. When the registry cannot be read (an error status, a timeout),
 nothing is remembered: reads fall back to the boot project for that call,
 `start_run` without a `projectId` refuses with the reason, and the next call
-reads the registry again. A run id
+reads the registry again. The cockpit's own endpoint ([`/api/v1/mcp`](#over-http-apiv1mcp))
+never has a working directory and applies the same rule. A run id
 is global: a read tool (`get_run`, `get_run_status`, `list_run_events`,
 `wait_for_runs`) given no `projectId` follows a run that lives in another
 project; `cancel_run` does not guess and names the project to pass instead. A
@@ -766,11 +767,14 @@ tool_timeout_sec = 60
 }
 ```
 
-**Which project.** Over HTTP there is no working directory to go by. Tools that
-name no `projectId` target the project the cockpit was started in, and
-`start_run` without a `projectId` works only when the cockpit serves that one
-project — otherwise it refuses and lists the projects to choose from. Reads
-follow a run id into its own project exactly as `cez mcp` does.
+**Which project.** Over HTTP there is no working directory to go by — the same
+case as `cez mcp` run where no registered project holds its directory, and the
+same rule. Tools that name no `projectId` read from the project the cockpit was
+started in, and `start_run` without a `projectId` works only when the cockpit
+serves that one project — otherwise it refuses and lists the projects (id and
+name) to choose from. There is no `--project` here: the agent passes
+`projectId`. Reads follow a run id into its own project exactly as `cez mcp`
+does.
 
 **Origin.** The request-origin guard checks `Origin` and `Sec-Fetch-Site` on
 every method of this path, not only on writes as elsewhere in the API: a browser

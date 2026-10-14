@@ -2,11 +2,12 @@ import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { RunStore } from '../runs/store.ts';
 import { createApp } from '../server/server.ts';
 import type { RunManager } from '../workflows/run.ts';
-import { MCP_PATH } from './http.ts';
+import { inProcessFetch, MCP_PATH } from './http.ts';
 import { mcpMode } from './mode.ts';
 
 /**
@@ -54,9 +55,10 @@ describe('/api/v1/mcp', () => {
     });
     /** A request as a non-browser MCP client sends it: loopback Host, no Origin. */
     const request = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-      const headers = new Headers(init?.headers);
+      const headers = new Headers(input instanceof Request ? input.headers : undefined);
+      new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
       if (!headers.has('host')) headers.set('host', '127.0.0.1:4321');
-      return app.request(input instanceof Request ? input.url : String(input), { ...init, headers });
+      return app.request(new Request(input, { ...init, headers }));
     };
     const connect = async (era: 'legacy' | 'auto') => {
       const client = new Client({ name: 'http-test', version: '0' }, { versionNegotiation: { mode: era } });
@@ -141,10 +143,30 @@ describe('/api/v1/mcp', () => {
     const client = await connect('auto');
     const result = await client.callTool({ name: 'start_run', arguments: { workflow: 'quick-task', task: 'hello' } });
     expect(result.isError).toBe(true);
-    expect(text(result)).toMatch(/^this cockpit serves \d+ projects \(.+\) — pass projectId/);
+    expect(text(result)).toMatch(/^this cockpit serves \d+ projects? \(.+\) — pass projectId/);
     // reads still go to the boot project
     const runs = await client.callTool({ name: 'list_workflows', arguments: {} });
     expect(runs.isError, text(runs)).toBeFalsy();
+  });
+
+  it('the in-process fetch keeps a Request\'s method, headers and body', async () => {
+    const echo = new Hono().all('/echo', async (c) =>
+      c.json({ method: c.req.method, host: c.req.header('host'), name: c.req.header('x-name'), body: await c.req.text() }),
+    );
+    const fetchIn = inProcessFetch(echo);
+    const asRequest = await fetchIn(
+      new Request('http://127.0.0.1/echo', { method: 'POST', headers: { 'x-name': 'req', host: 'evil.example' }, body: '{"a":1}' }),
+    );
+    expect(await asRequest.json()).toEqual({ method: 'POST', host: '127.0.0.1', name: 'req', body: '{"a":1}' });
+    // init wins over the Request, as in fetch()
+    const overridden = await fetchIn(new Request('http://127.0.0.1/echo', { method: 'POST', headers: { 'x-name': 'req' }, body: 'x' }), {
+      method: 'PUT',
+      headers: { 'x-name': 'init' },
+      body: 'y',
+    });
+    expect(await overridden.json()).toEqual({ method: 'PUT', host: '127.0.0.1', name: 'init', body: 'y' });
+    const asString = await fetchIn('http://127.0.0.1/echo', { method: 'DELETE' });
+    expect(await asString.json()).toMatchObject({ method: 'DELETE', host: '127.0.0.1', body: '' });
   });
 
   describe('the origin guard covers every method on this path', () => {

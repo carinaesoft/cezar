@@ -9,9 +9,9 @@
  */
 import type { Hono } from 'hono';
 import type { McpHttpHandler } from '@modelcontextprotocol/server';
-import { createApiClient, readJson, type CezarClient } from './api.ts';
+import { createApiClient, readJson, type CezarClient, type CezarFetch } from './api.ts';
 import type { McpMode } from './mode.ts';
-import type { Cockpit } from './tools.ts';
+import { describeProjectChoice, type Cockpit } from './tools.ts';
 
 export const MCP_PATH = '/api/v1/mcp';
 
@@ -25,11 +25,10 @@ export async function inProcessCockpit(api: CezarClient): Promise<Cockpit> {
     const { projects, bootProject } = await readJson(await api.api.v1.projects.$get());
     const only = projects.length === 1 && projects[0]!.id === bootProject;
     if (only) return { api, defaultProjectId: bootProject };
-    const listed = projects.map((p) => (p.name && p.name !== p.id ? `${p.id} (${p.name})` : p.id)).join(', ');
     return {
       api,
       defaultProjectId: bootProject,
-      projectUnknown: `this cockpit serves ${projects.length} projects (${listed || 'none registered'}) — pass projectId to say which one the run belongs to`,
+      projectUnknown: `this cockpit serves ${describeProjectChoice(projects)} — pass projectId to say which one the run belongs to`,
     };
   } catch (error) {
     return {
@@ -40,6 +39,17 @@ export async function inProcessCockpit(api: CezarClient): Promise<Cockpit> {
   }
 }
 
+/** A fetch that hands the request to `app` in-process. A `Request` keeps its method, headers and
+ *  body; a loopback Host is what the origin guard expects of a local caller (no Origin is sent). */
+export function inProcessFetch(app: Pick<Hono, 'request'>): CezarFetch {
+  return async (input, init) => {
+    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
+    headers.set('host', '127.0.0.1');
+    return app.request(new Request(input, { ...init, headers }));
+  };
+}
+
 /** Mount `/api/v1/mcp` (POST; GET and DELETE answer the SDK's 405 in stateless mode). */
 export function mountMcp(app: Hono, options: { mode: Exclude<McpMode, 'off'>; version: string }): void {
   let handler: Promise<McpHttpHandler> | undefined;
@@ -48,15 +58,7 @@ export function mountMcp(app: Hono, options: { mode: Exclude<McpMode, 'off'>; ve
       import('@modelcontextprotocol/server'),
       import('./tools.ts'),
     ]);
-    const api = createApiClient({
-      baseUrl: 'http://127.0.0.1',
-      // A loopback Host is what the origin guard expects of a local caller; no Origin is sent.
-      fetch: async (input, init) => {
-        const headers = new Headers(init?.headers);
-        headers.set('host', '127.0.0.1');
-        return app.request(input instanceof Request ? input.url : String(input), { ...init, headers });
-      },
-    });
+    const api = createApiClient({ baseUrl: 'http://127.0.0.1', fetch: inProcessFetch(app) });
     const tools = { cockpit: () => inProcessCockpit(api), version: options.version, readOnly: options.mode === 'read-only' };
     return createMcpHandler(() => buildMcpServer(tools));
   };
