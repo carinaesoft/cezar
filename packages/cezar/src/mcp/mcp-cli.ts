@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import type { Readable, Writable } from 'node:stream';
 import type { McpServerFactory } from '@modelcontextprotocol/server';
 import { createApiClient, hasOwnDeadline, isConnectionError, type CezarFetch } from './api.ts';
-import { buildMcpServer, type Cockpit } from './tools.ts';
+import { buildMcpServer, describeProjectChoice, type Cockpit, type ProjectChoice } from './tools.ts';
 
 export const DEFAULT_PORTS = { first: 4321, last: 4370 } as const;
 /** Same bound as `cez runs`: a stalled cockpit or proxy must not hang an agent's tool call. */
@@ -33,7 +33,8 @@ const USAGE = `cez mcp — MCP server (stdio) for a running cezar cockpit
 
   --url        cockpit to talk to (default: $CEZ_API_URL, else the cockpit found on 127.0.0.1:4321-4370)
   --project    default project for tools that take one (default: $CEZ_PROJECT_ID, else the project
-               holding the current directory, else the cockpit's boot project)
+               holding the current directory; reads then fall back to the cockpit's boot project,
+               start_run asks for a projectId unless the cockpit serves a single project)
   --header     extra HTTP header for a cockpit behind a proxy (Basic auth, Cloudflare Access); repeatable
   --read-only  register only the read tools (no start_run / cancel_run)
 
@@ -73,6 +74,8 @@ export interface DiscoveredCockpit {
   projectId?: string;
   /** The id of the project the cockpit was booted in, when its registry was read. */
   bootProject?: string;
+  /** No registered project holds `cwd`: the ones `start_run` must choose from. */
+  projects?: ProjectChoice[];
   /** This cockpit's project registry could not be read, and why. */
   registryUnread?: string;
   /** What the choice was made without — a port that stalled, a registry that failed. Such an
@@ -99,6 +102,8 @@ interface Registry {
   /** The id and root of the project the cockpit was booted in, when the registry lists it. */
   bootProject?: string;
   bootRoot?: string;
+  /** Every registered project, for a choice the cwd cannot make. */
+  projects?: ProjectChoice[];
   /** The registry could not be read, and why: which project holds `cwd` is then unknown. */
   failed?: string;
 }
@@ -111,13 +116,20 @@ async function readRegistry(fetchImpl: CezarFetch, url: string, cwd: string, tim
     if (!res.ok) return { failed: `${res.status} ${res.statusText}`.trim() };
     const body = (await res.json()) as { bootProject?: unknown; projects?: unknown };
     if (!Array.isArray(body.projects)) return { failed: 'not a project list' };
-    const projects = (body.projects as Array<{ id?: unknown; root?: unknown }>).flatMap((p) =>
-      typeof p.id === 'string' && typeof p.root === 'string' ? [{ id: p.id, root: p.root }] : [],
+    const projects = (body.projects as Array<{ id?: unknown; name?: unknown; root?: unknown }>).flatMap((p) =>
+      typeof p.id === 'string' && typeof p.root === 'string'
+        ? [{ id: p.id, root: p.root, ...(typeof p.name === 'string' ? { name: p.name } : {}) }]
+        : [],
     );
     const holding = projects.filter((p) => inside(cwd, p.root)).sort((a, b) => b.root.length - a.root.length)[0];
     const bootProject = typeof body.bootProject === 'string' ? body.bootProject : undefined;
     const bootRoot = projects.find((p) => p.id === bootProject)?.root;
-    return { ...(holding ? { holding } : {}), ...(bootProject ? { bootProject } : {}), ...(bootRoot ? { bootRoot } : {}) };
+    return {
+      ...(holding ? { holding } : {}),
+      ...(bootProject ? { bootProject } : {}),
+      ...(bootRoot ? { bootRoot } : {}),
+      projects: projects.map(({ id, name }) => ({ id, ...(name ? { name } : {}) })),
+    };
   } catch (error) {
     return { failed: isTimeout(error) ? `no answer within ${timeoutMs} ms` : (error as Error).message };
   }
@@ -177,6 +189,7 @@ export async function discoverCockpit(fetchImpl: CezarFetch, cwd: string, header
     url: c.url,
     ...(c.holding ? { projectId: c.holding.id } : {}),
     ...(c.bootProject ? { bootProject: c.bootProject } : {}),
+    ...(!c.holding && c.projects ? { projects: c.projects } : {}),
     ...(c.failed ? { registryUnread: c.failed } : {}),
     ...(incomplete.length ? { incomplete } : {}),
     ...(stalled.length ? { stalledPorts: stalled } : {}),
@@ -242,6 +255,7 @@ export function createCockpitResolver(options: CockpitResolverOptions): () => Pr
         url: options.explicitUrl,
         ...(registry.holding ? { projectId: registry.holding.id } : {}),
         ...(registry.bootProject ? { bootProject: registry.bootProject } : {}),
+        ...(!registry.holding && registry.projects ? { projects: registry.projects } : {}),
         ...(registry.failed ? { registryUnread: registry.failed, incomplete: [`${options.explicitUrl} did not list its projects (${registry.failed})`] } : {}),
       };
     } else if (options.insideTask) {
@@ -251,20 +265,28 @@ export function createCockpitResolver(options: CockpitResolverOptions): () => Pr
     } else target = await discoverCockpit(options.fetch, options.cwd, options.headers);
     const incomplete = target.incomplete ?? [];
     for (const line of incomplete) options.warn?.(`${line} — used ${target.url} for this call only, will look again on the next`);
-    // Without the registry the project holding the cwd is unknown: reads fall back to the boot
-    // project, a write must not guess (start_run, re-QA of #1109).
+    // Without the registry the project holding the cwd is unknown; with it, none may hold the cwd
+    // (a cockpit on another machine, --url). Reads fall back to the boot project, start_run must
+    // not guess — unless the cockpit serves that one project (as over HTTP).
     const unknown = !options.projectId && target.registryUnread;
+    const only = target.projects?.length === 1 && target.projects[0]!.id === target.bootProject;
+    const unheld = !options.projectId && !unknown && !target.projectId && !only;
     const stalled = target.stalledPorts ?? [];
     return {
       cockpit: {
         api: createApiClient({ baseUrl: target.url, fetch: fetchWithDeadline, ...(options.headers ? { headers: options.headers } : {}) }),
-        // No project holds the cwd: the cockpit's boot project.
+        // No project holds the cwd: reads use the boot project (start_run, see projectUnknown).
         defaultProjectId: options.projectId ?? target.projectId ?? target.bootProject ?? 'default',
         ...(unknown
           ? {
               projectUnknown: `could not read the project list of ${target.url} (${target.registryUnread}), so which project holds ${options.cwd} is unknown — pass projectId (list_projects), or try again`,
             }
-          : {}),
+          : unheld
+            ? {
+                projectUnknown: `no project of ${target.url} holds ${options.cwd}, and it serves ${describeProjectChoice(target.projects ?? [])} — pass projectId to say which one the run belongs to, or start cez mcp with --project <id> (or CEZ_PROJECT_ID)`,
+              }
+            : {}),
+        ...(incomplete.length ? { warnings: incomplete.map((line) => `${line} — answered from ${target.url}`) } : {}),
         // A silent port may be the right cockpit: reads still answer from the one found, a write
         // would land in the wrong one.
         ...(stalled.length
