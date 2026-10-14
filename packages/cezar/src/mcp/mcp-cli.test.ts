@@ -380,7 +380,7 @@ describe('cez mcp flags', () => {
     const names = (await client.listTools()).tools.map((t) => t.name);
     await client.close();
     expect(names).not.toContain('start_run');
-    expect(names).not.toContain('cancel_run');
+    for (const name of ['start_run', 'cancel_run', 'push_run_branch', 'send_run_message', 'review_run']) expect(names).not.toContain(name);
     expect(names).toContain('wait_for_runs');
   });
 
@@ -417,6 +417,9 @@ describe('cez mcp flags', () => {
       ['start_run', { workflow: 'quick-task', task: 'x' }],
       ['start_run', { workflow: 'quick-task', task: 'x', projectId: 'repob' }],
       ['cancel_run', { runId: 'r1' }],
+      ['push_run_branch', { runId: 'r1' }],
+      ['send_run_message', { runId: 'r1', text: 'x' }],
+      ['review_run', { runId: 'r1', decision: 'accept' }],
     ] as const) {
       const refused = await client.callTool({ name, arguments: args });
       expect(refused.isError, name).toBe(true);

@@ -1,4 +1,5 @@
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Hono } from 'hono';
@@ -23,6 +24,7 @@ describe('cez mcp tools over the real /api/v1 router', () => {
   let app: Hono;
   let started: Array<{ workflow: string; input: Record<string, unknown> }>;
   let cancelled: string[];
+  let engine: string[];
   let mcp: Client;
   const saved = { dryRun: process.env.CEZ_DRY_RUN, home: process.env.CEZ_HOME };
 
@@ -34,7 +36,28 @@ describe('cez mcp tools over the real /api/v1 router', () => {
     store = RunStore.open(join(repoRoot, '.ai/cezar'));
     started = [];
     cancelled = [];
+    engine = [];
     const manager = {
+      isActive: () => false,
+      sendMessage: (id: string, content: Array<{ type: string; text?: string }>) => {
+        engine.push(`message ${id}: ${content.map((b) => b.text).join('')}`);
+        if (store.getRun(id)?.status !== 'waiting') return false;
+        store.updateRun(id, { status: 'running' });
+        return true;
+      },
+      enqueueMessage: () => null,
+      deferMessage: () => false,
+      finish: (id: string) => {
+        engine.push(`finish ${id}`);
+        if (store.getRun(id)?.status !== 'review') return false;
+        store.updateRun(id, { status: 'done' });
+        return true;
+      },
+      continueRun: (id: string, opts: { text?: string }) => {
+        engine.push(`continue ${id}: ${opts.text}`);
+        store.updateRun(id, { status: 'running' });
+        return { ok: true };
+      },
       startRun: (workflow: { name: string }, input: { task: string } & Record<string, unknown>) => {
         started.push({ workflow: workflow.name, input });
         return store.createRun({ title: input.task, workflow: workflow.name, task: input.task, steps: [] });
@@ -103,12 +126,84 @@ describe('cez mcp tools over the real /api/v1 router', () => {
   });
 
   it('an unknown run is a 404 from every run tool', async () => {
-    for (const name of ['get_run', 'get_run_status', 'list_run_events', 'cancel_run']) {
+    const notFound = 'cezar refused: 404: not found — no project of this cockpit has a run nope — check the id (list_runs)';
+    for (const name of ['get_run', 'get_run_status', 'list_run_events']) {
       const result = await call(name, { runId: 'nope' });
       expect(result.isError, name).toBe(true);
       // the real index does not list it either: no project has it
-      expect(text(result), name).toBe('cezar refused: 404: not found — no project of this cockpit has a run nope — check the id (list_runs)');
+      expect(text(result), name).toBe(notFound);
     }
+    // A write never guesses: it lists the projects (none in this unregistered temp repo's registry).
+    for (const [name, args] of [
+      ['cancel_run', {}],
+      ['push_run_branch', {}],
+      ['send_run_message', { text: 'hi' }],
+      ['review_run', { decision: 'accept' }],
+    ] as const) {
+      const result = await call(name, { runId: 'nope', ...args });
+      expect(result.isError, name).toBe(true);
+      expect(text(result), name).toMatch(new RegExp(`^${notFound.replace(/[()]/g, '\\$&')}; this cockpit serves \\d+ projects? \\(.*\\) — pass projectId to say which one holds it$`));
+    }
+    expect(engine).toEqual([]);
+  });
+
+  it('send_run_message at waiting → review_run send_back → review_run accept, through the routes', async () => {
+    const run = store.createRun({ title: 't', workflow: 'quick-task', task: 't', steps: [] });
+    store.updateRun(run.id, { status: 'waiting' });
+    const answered = await call('send_run_message', { runId: run.id, text: 'Use option B' });
+    expect(answered.structuredContent).toEqual({ delivered: true, projectId: 'default', runId: run.id, status: 'waiting' });
+
+    store.updateRun(run.id, { status: 'done' });
+    const late = await call('send_run_message', { runId: run.id, text: 'too late' });
+    expect(text(late)).toMatch(/^run .* is done: send_run_message reaches only a waiting, running or queued run/);
+
+    store.updateRun(run.id, { status: 'review' });
+    const sentBack = await call('review_run', { runId: run.id, decision: 'send_back', notes: 'Rename it' });
+    expect(sentBack.structuredContent).toEqual({ continued: true, projectId: 'default', runId: run.id, decision: 'send_back', status: 'running' });
+
+    store.updateRun(run.id, { status: 'review' });
+    const accepted = await call('review_run', { runId: run.id, decision: 'accept' });
+    expect(accepted.structuredContent).toEqual({ finished: true, projectId: 'default', runId: run.id, decision: 'accept', status: 'done' });
+    expect(engine).toEqual([`message ${run.id}: Use option B`, `continue ${run.id}: Review feedback:\nRename it`, `finish ${run.id}`]);
+  });
+
+  it('push_run_branch pushes the worktree branch to a local bare remote, and a non-fast-forward is refused', async () => {
+    const g = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+    const bare = join(repoRoot, 'remote.git');
+    const worktree = join(repoRoot, 'wt');
+    g(repoRoot, 'init', '-q', '--bare', bare);
+    g(repoRoot, 'init', '-q', '-b', 'main', worktree);
+    for (const [k, v] of [['user.email', 't@cezar.local'], ['user.name', 't'], ['commit.gpgsign', 'false']]) g(worktree, 'config', k!, v!);
+    g(worktree, 'remote', 'add', 'origin', bare);
+    writeFileSync(join(worktree, 'a.txt'), 'a\n');
+    g(worktree, 'add', '-A');
+    g(worktree, 'commit', '-qm', 'base');
+    g(worktree, 'checkout', '-qb', 'cez/task');
+    writeFileSync(join(worktree, 'a.txt'), 'b\n');
+    g(worktree, 'commit', '-qam', 'fix: the thing');
+    const run = store.createRun({ title: 't', workflow: 'quick-task', task: 't', steps: [] });
+    store.updateRun(run.id, { status: 'review', worktreePath: worktree, baseBranch: 'main', branch: 'cez/task' });
+
+    const pushed = await call('push_run_branch', { runId: run.id });
+    expect(pushed.isError, text(pushed)).toBeFalsy();
+    const head = g(worktree, 'rev-parse', 'HEAD');
+    expect(pushed.structuredContent).toEqual({
+      pushed: true, branch: 'cez/task', remote: 'origin', upstreamSet: true, projectId: 'default', runId: run.id,
+      head: { sha: head, subject: 'fix: the thing' }, commits: 1,
+    });
+    expect(g(bare, 'rev-parse', 'refs/heads/cez/task')).toBe(head);
+
+    // Someone else moves the remote branch; the run's rewritten history is refused, not forced.
+    const other = join(repoRoot, 'other');
+    g(repoRoot, 'clone', '-q', '-b', 'cez/task', bare, other);
+    for (const [k, v] of [['user.email', 'o@cezar.local'], ['user.name', 'o'], ['commit.gpgsign', 'false']]) g(other, 'config', k!, v!);
+    g(other, 'commit', '-q', '--allow-empty', '-m', 'theirs');
+    g(other, 'push', '-q');
+    g(worktree, 'commit', '-q', '--allow-empty', '-m', 'ours');
+    const refused = await call('push_run_branch', { runId: run.id });
+    expect(refused.isError).toBe(true);
+    expect(text(refused)).toMatch(/^cezar refused: 409: push rejected: \[rejected\] .*\((fetch first|non-fast-forward)\) — .* cez mcp does not force-push/);
+    expect(g(bare, 'log', '-1', '--format=%s', 'refs/heads/cez/task')).toBe('theirs');
   });
 
   it('the read tools reach their routes and answer in their output schema', async () => {

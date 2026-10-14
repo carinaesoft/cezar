@@ -21,14 +21,21 @@ import { z } from 'zod';
 import {
   apiRunSchema,
   cancelResponseSchema,
+  continueResponseSchema,
   createRunInputBaseSchema,
+  finishResponseSchema,
   githubRefStatusDataSchema,
+  gitPushResponseSchema,
+  messageInputSchema,
+  messageResponseSchema,
   modelDiscoveryRunnerSchema,
   projectListEntrySchema,
   projectsResponseSchema,
   REFERENCE_STATUS_MAX,
   runHistoryCursorSchema,
   runHistoryEventSchema,
+  runCommitSchema,
+  runCommitsResponseSchema,
   runHistoryPageSchema,
   runIdParamSchema,
   runIndexEntrySchema,
@@ -112,6 +119,13 @@ export const startRunInputSchema = createRunInputBaseSchema
     workflow: createRunInputBaseSchema.shape.workflow.unwrap().describe('Workflow name from list_workflows (e.g. "quick-task").'),
     task: createRunInputBaseSchema.shape.task.describe('What the agent should do — the prompt.'),
   });
+
+/** `POST /runs/:id/messages` takes text and attachments; the tool sends text only. */
+const messageText = messageInputSchema.shape.text.unwrap();
+/** The review panel's Send back prefixes the notes exactly like this (review-panel.tsx). */
+export const REVIEW_FEEDBACK_PREFIX = 'Review feedback:\n';
+/** Statuses `POST /messages` delivers or stacks a message in; anything else answers 409. */
+const LIVE_STATUSES = new Set(['queued', 'running', 'waiting']);
 
 // ---- outputs ---------------------------------------------------------------------------------
 
@@ -213,6 +227,36 @@ const prStatusOutput = refStatusAvailable
 
 const modelsOutput = runnerModelCatalogResponseSchema.extend({ warnings: warningsField });
 
+const runRef = { projectId: z.string(), runId: z.string() };
+
+const pushOutput = gitPushResponseSchema.extend({
+  ...runRef,
+  head: runCommitSchema
+    .pick({ sha: true, subject: true })
+    .optional()
+    .describe("The branch's newest commit after the push — what the remote now has."),
+  commits: z.number().int().optional().describe('Commits on the branch past its base.'),
+  warnings: warningsField,
+});
+
+/** `/messages` answers a union; an MCP output schema must be one object, so its members are merged. */
+const [delivered, queued, deferred] = messageResponseSchema.options;
+const messageOutput = delivered
+  .partial()
+  .extend(queued.partial().shape)
+  .extend(deferred.partial().shape)
+  .extend({ ...runRef, status: z.string().describe('The run status the message was sent at.'), warnings: warningsField });
+
+const reviewOutput = finishResponseSchema
+  .partial()
+  .extend(continueResponseSchema.partial().shape)
+  .extend({
+    ...runRef,
+    decision: z.enum(['accept', 'send_back']),
+    status: z.string().optional().describe('The run status right after the decision.'),
+    warnings: warningsField,
+  });
+
 // ---- plumbing --------------------------------------------------------------------------------
 
 const READ: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
@@ -294,7 +338,11 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       instructions:
         'Cezar runs AI agent tasks ("runs") in git worktrees. Start with list_projects / list_runs. ' +
         'start_run returns immediately with a run id; follow it with wait_for_runs (bounded — on timedOut, call it again) ' +
-        'or get_run_status. Runs parked at "waiting" or "review" need a human in the cezar cockpit.',
+        'or get_run_status. ' +
+        (options.readOnly
+          ? 'Runs parked at "waiting" or "review" need a human in the cezar cockpit.'
+          : 'A run parked at "waiting" takes an answer through send_run_message; one at "review" a decision through review_run. ' +
+            'push_run_branch publishes its branch.'),
     },
   );
   const projectOf = (c: Cockpit, projectId: string | undefined) => projectId ?? c.defaultProjectId;
@@ -423,7 +471,7 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
     return { found: index.runs.find((r) => r.id === runId)?.projectId, capped: index.truncated };
   };
   const isNotFound = (error: unknown) => error instanceof CezarApiError && error.status === 404;
-  const notFoundHint = (runId: string, error: CezarApiError, lookup?: { found?: string; capped: string[] }) => {
+  const notFoundHint = (runId: string, error: CezarApiError, lookup?: { found?: string; capped: string[] }, choice?: string) => {
     const hint = !lookup
       ? `run ${runId} is not in the default project; pass its projectId (list_runs shows it)`
       : lookup.found
@@ -431,12 +479,15 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
         : lookup.capped.length
           ? `run ${runId} is in no project's recent runs (older runs of ${lookup.capped.join(', ')} are not indexed) — check the id, or pass its projectId`
           : `no project of this cockpit has a run ${runId} — check the id (list_runs)`;
-    return new CezarApiError(404, `${error.message} — ${hint}`);
+    const choose = choice && !lookup?.found ? `; this cockpit serves ${choice} — pass projectId to say which one holds it` : '';
+    return new CezarApiError(404, `${error.message} — ${hint}${choose}`);
   };
+  const projectChoice = async (c: Cockpit) => describeProjectChoice((await readJson(await c.api.api.v1.projects.$get())).projects);
   /**
    * Run `fn` against the run's project. Named: that one. Not named: the default project, and on a
    * 404 the project the cross-project index places the run in — a run id is global, so a read may
-   * follow it. Writes pass `follow: false` and get the hint instead of a guess.
+   * follow it. Writes pass `follow: false` and get the hint instead of a guess — with the
+   * project list when the index cannot place the run.
    */
   const inRunProject = async <T>(
     c: Cockpit,
@@ -453,7 +504,8 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       const lookup = await findRunProject(c, runId).catch(() => undefined);
       const found = lookup?.found;
       if (follow && found && found !== c.defaultProjectId) return fn(found);
-      throw notFoundHint(runId, error as CezarApiError, lookup);
+      const choice = follow || found ? undefined : await projectChoice(c).catch(() => undefined);
+      throw notFoundHint(runId, error as CezarApiError, lookup, choice);
     }
   };
   const readRun = async (c: Cockpit, projectId: string, runId: string, signal?: AbortSignal) =>
@@ -693,7 +745,148 @@ export function buildMcpServer(options: McpToolsOptions): McpServer {
       ),
   );
 
+  /** The run a write targets, read first so the tool can check its status — never followed into
+   *  another project (`inRunProject`). */
+  const runForWrite = (c: Cockpit, projectId: string | undefined, runId: string) =>
+    inRunProject(c, projectId, runId, async (pid) => ({ pid, run: await readRun(c, pid, runId) }), { follow: false });
+  const statusNow = async (c: Cockpit, pid: string, runId: string) => (await readRun(c, pid, runId).catch(() => undefined))?.status;
+
+  server.registerTool(
+    'push_run_branch',
+    {
+      title: 'Push run branch',
+      description:
+        "Push the run's worktree branch to its remote — the cockpit's Push button (POST /runs/:id/git/push). " +
+        'Commits only what is already committed, sets the upstream on the first push, and never force-pushes: ' +
+        'a rejection (the remote has commits the branch lacks) is returned as an error, not retried. ' +
+        'The remote is the cockpit\'s own choice (its push remote, usually origin). Answers with the branch, remote and newest commit.',
+      inputSchema: runArgs,
+      outputSchema: pushOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    ({ projectId, runId }) =>
+      write(async (c) => {
+        const { pid } = await runForWrite(c, projectId, runId);
+        const param = { projectId: pid, id: runId };
+        const pushed = await readJson(await c.api.api.v1.p[':projectId'].runs[':id'].git.push.$post({ param })).catch((error: unknown) => {
+          throw describePushRefusal(error);
+        });
+        // The route names no commit; the branch log does. Best-effort: the push itself has landed.
+        const log = await c.api.api.v1.p[':projectId'].runs[':id'].commits
+          .$get({ param })
+          .then((res) => readJson(res))
+          .then((body) => runCommitsResponseSchema.parse(body).commits)
+          .catch(() => undefined);
+        const [head] = log ?? [];
+        return pushOutput.parse({
+          ...gitPushResponseSchema.parse(pushed),
+          projectId: pid,
+          runId,
+          ...(head ? { head: { sha: head.sha, subject: clip(head.subject, 300) } } : {}),
+          ...(log ? { commits: log.length } : {}),
+        });
+      }),
+  );
+
+  server.registerTool(
+    'send_run_message',
+    {
+      title: 'Send run message',
+      description:
+        "Answer a run — the cockpit's composer (POST /runs/:id/messages). At \"waiting\" (the agent asked or finished a turn) " +
+        'the text goes into its open session and the run works again; at "running" it reaches the agent mid-turn; at ' +
+        '"queued" it is added to the prompt. Any other status is an error: it never reopens a finished run, and a run at ' +
+        '"review" takes review_run instead. The agent acts on the message — it costs agent usage.',
+      inputSchema: runArgs.extend({ text: messageText.trim().min(1).describe('The message, as the user would type it.') }),
+      outputSchema: messageOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    ({ projectId, runId, text }) =>
+      write(async (c) => {
+        const { pid, run } = await runForWrite(c, projectId, runId);
+        if (!LIVE_STATUSES.has(run.status)) throw new Error(notLive(runId, run.status));
+        const param = { projectId: pid, id: runId };
+        const answer = await readJson(await c.api.api.v1.p[':projectId'].runs[':id'].messages.$post({ param, json: { text } })).catch(
+          async (error: unknown) => {
+            // The session closed between the read and the post.
+            if (error instanceof CezarApiError && error.status === 409) {
+              const now = await statusNow(c, pid, runId);
+              throw new Error(`${describeError(error)}${now ? ` — ${notLive(runId, now)}` : ''}`);
+            }
+            throw error;
+          },
+        );
+        return messageOutput.parse({ ...messageResponseSchema.parse(answer), projectId: pid, runId, status: run.status });
+      }),
+  );
+
+  server.registerTool(
+    'review_run',
+    {
+      title: 'Review run',
+      description:
+        'Decide on a run parked at "review" — the cockpit\'s review gate. ' +
+        '"accept" (✓ Accept, POST /runs/:id/finish) only marks the run done: nothing is merged, committed, pushed or opened as a PR, ' +
+        'and the worktree and branch stay as they are — publish with push_run_branch. ' +
+        '"send_back" (↩ Send back, POST /runs/:id/continue) sends notes into the agent\'s session prefixed "Review feedback:"; ' +
+        'the agent works on them (costs agent usage) and parks again at waiting or review. ' +
+        'Any status other than "review" is an error.',
+      inputSchema: runArgs.extend({
+        decision: z.enum(['accept', 'send_back']).describe('"accept" or "send_back".'),
+        notes: messageText
+          .max(messageText.maxLength! - REVIEW_FEEDBACK_PREFIX.length)
+          .optional()
+          .describe('What to change — required for send_back, refused with accept.'),
+      }),
+      outputSchema: reviewOutput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    ({ projectId, runId, decision, notes }) =>
+      write(async (c) => {
+        const feedback = notes?.trim();
+        if (decision === 'send_back' && !feedback) throw new Error('send_back needs notes: write what to change');
+        if (decision === 'accept' && feedback) throw new Error('accept takes no notes — use send_back to send them to the agent');
+        const { pid, run } = await runForWrite(c, projectId, runId);
+        if (run.status !== 'review') throw new Error(`run ${runId} is ${run.status}, not review — review_run only decides at the review gate`);
+        const param = { projectId: pid, id: runId };
+        const route = c.api.api.v1.p[':projectId'].runs[':id'];
+        const answer =
+          decision === 'accept'
+            ? finishResponseSchema.parse(await readJson(await route.finish.$post({ param })))
+            : continueResponseSchema.parse(await readJson(await route.continue.$post({ param, json: { text: `${REVIEW_FEEDBACK_PREFIX}${feedback}` } })));
+        const status = await statusNow(c, pid, runId);
+        return reviewOutput.parse({ ...answer, projectId: pid, runId, decision, ...(status ? { status } : {}) });
+      }),
+  );
+
   return server;
+}
+
+function notLive(runId: string, status: string): string {
+  const next =
+    status === 'review'
+      ? 'decide with review_run'
+      : 'it is finished — cez mcp does not reopen finished runs (the cockpit\'s Continue does)';
+  return `run ${runId} is ${status}: send_run_message reaches only a waiting, running or queued run — ${next}`;
+}
+
+/** A refused push, in words the model can act on. Rejections are never retried — that would
+ *  take a force. A cockpit before this fix reports only git's `To <url>` line. */
+function describePushRefusal(error: unknown): unknown {
+  if (!(error instanceof CezarApiError) || error.status !== 409) return error;
+  if (/non-fast-forward|fetch first|\[rejected\]/.test(error.message)) {
+    return new Error(
+      `${describeError(error)} — the remote branch has commits this branch lacks (non-fast-forward). ` +
+        'cez mcp does not force-push: have the run merge the remote branch (send_run_message), then push again',
+    );
+  }
+  if (/^\d+: To /.test(error.message)) {
+    return new Error(
+      `${describeError(error)} — the remote refused the push (this cockpit reports only the destination line; ` +
+        'usually the remote branch has commits this branch lacks). cez mcp does not force-push',
+    );
+  }
+  return error;
 }
 
 /**
