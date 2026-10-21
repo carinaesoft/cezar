@@ -7,6 +7,8 @@ import {
 } from '@open-mercato/cezar-contract';
 import { SecretStore, SecretsError, type SecretScopeRef } from '../workspace/secrets.ts';
 import { E2E_SETUP_TASK, e2eCredentialsAmong, e2eSetupWorkflow, latestE2eSetupRun, readE2eStatus, setupInFlight } from '../e2e-setup.ts';
+import { MCP_PATH, mountMcp } from '../mcp/http.ts';
+import { mcpMode } from '../mcp/mode.ts';
 import { createTrackerService } from './tracker/index.ts';
 import { TrackerWatches } from './tracker/watch.ts';
 import { readTrackerAssociation, writeTrackerAssociation, clearTrackerAssociation } from '../tracker-association.ts';
@@ -1410,7 +1412,10 @@ export function createApp(deps: ServerDeps) {
   // CEZ_REMOTE flips take effect live (and tests can toggle it).
   const trackers = createTrackerService();
   const trackerWatches = new TrackerWatches(trackers, deps.socketHub);
-  const capabilities = () => resolveCapabilities(process.env, bindHost);
+  // `mcp` is the mode the route was mounted with: unlike the flags read per request, mounting
+  // happens once, so a CEZ_MCP flipped later must not make /health promise a route that is not there.
+  const bootMcp = mcpMode();
+  const capabilities = () => ({ ...resolveCapabilities(process.env, bindHost), mcp: bootMcp });
   const singleProjectRefusal = (
     action: 'adding projects' | 'editing projects' | 'removing projects' | 'folder browsing',
   ) => ({ error: `single-project mode is enabled; ${action} is disabled` });
@@ -1548,7 +1553,9 @@ export function createApp(deps: ServerDeps) {
     // relying on the mutating-methods gate below to let its GETs through.
     if (c.req.path === `${V1_PREFIX}/health`) return next();
 
-    if (MUTATING_METHODS.has(c.req.method)) {
+    // The MCP endpoint is guarded for EVERY method (#1109): a real client sends a GET on each
+    // connect, and nothing about that path should rest on the SDK answering it 405.
+    if (MUTATING_METHODS.has(c.req.method) || c.req.path === MCP_PATH) {
       const origin = c.req.header('origin');
       if (origin !== undefined) {
         const originHost = hostnameOfOrigin(origin);
@@ -7048,6 +7055,10 @@ export function createApp(deps: ServerDeps) {
   // an unknown API path must never answer with HTML.
   // Without a web/dist build this serves the built-in build-hint page (dev-only
   // state — the published tarball ships web/dist), never a 404.
+  // `CEZ_MCP` (#1109): before the catch-all, which would answer its GET with the shell. Unchained
+  // on purpose — see src/mcp/http.ts.
+  if (bootMcp !== 'off') mountMcp(routed, { mode: bootMcp, version: deps.version });
+
   routed.get('*', (c) => serveShell(c) ?? c.notFound());
 
   return routed;
