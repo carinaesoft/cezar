@@ -835,6 +835,13 @@ export async function pushCurrentBranch(dir: string): Promise<PushResult> {
   const upstream = await git(dir, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
   const args = upstream.ok ? ['push'] : ['push', '-u', remote, branch];
   const push = await git(dir, args);
-  if (!push.ok) return { ok: false, error: gitReason(push, 'git push failed') };
+  if (!push.ok) return { ok: false, error: pushRejection(push) ?? gitReason(push, 'git push failed') };
   return { ok: true, branch, remote, upstreamSet: !upstream.ok };
+}
+
+/** A ref the remote refused: git's first stderr line is only `To <url>`, the reason is the
+ *  `! [rejected] … (non-fast-forward)` line below it. */
+function pushRejection(res: GitResult): string | undefined {
+  const line = res.stderr.split('\n').find((l) => /^\s*!\s*\[(remote )?rejected\]/.test(l));
+  return line?.trim().replace(/^!\s*/, 'push rejected: ').replace(/\s+/g, ' ');
 }

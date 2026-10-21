@@ -36,7 +36,8 @@ const USAGE = `cez mcp — MCP server (stdio) for a running cezar cockpit
                holding the current directory; reads then fall back to the cockpit's boot project,
                start_run asks for a projectId unless the cockpit serves a single project)
   --header     extra HTTP header for a cockpit behind a proxy (Basic auth, Cloudflare Access); repeatable
-  --read-only  register only the read tools (no start_run / cancel_run)
+  --read-only  register only the read tools (no start_run, cancel_run, push_run_branch,
+               send_run_message, review_run)
 
   Claude Code:  claude mcp add cezar -- npx -y cezar-run mcp`;
 
